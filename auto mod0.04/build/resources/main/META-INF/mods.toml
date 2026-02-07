@@ -1,0 +1,29 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+# issueTrackerURL="https://..."
+
+[[mods]]
+modId="automodsync"
+version="3.1.2"
+displayName="Auto Mod Sync"
+authors="秋千"
+credits="XiaoArin"
+# logoFile="logo.png"
+description='''
+???????? V2 (Smart Sync Edition)
+
+核心特性:
+1. 三级校验机制: 本地自检修复 -> 服务端增量同步 -> 权威清单兜底.
+2. 仓库备份系统: 自动全量备份成功进服的模组. 误删文件可直接从本地仓库秒恢复.
+3. 智能抵消算法: 自动识别"本地误删"与"服务端移除", 避免无效报错.
+4. 信道与权威清单: 自动识别仅双端模组, 保护玩家的客户端模组不被误删.
+'''
+
+[[dependencies.automodsync]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="SERVER"
+

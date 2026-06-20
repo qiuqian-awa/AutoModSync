@@ -48,11 +48,19 @@ public class ClientSideManager {
 
     private static int liveServerVersion = 0;
 
-    private static final Path CLIENT_STORAGE_DIR = FMLPaths.GAMEDIR.get().resolve("automodsync_client_storage");
-    private static final Path CLIENT_SNAPSHOT_FILE = CLIENT_STORAGE_DIR.resolve("client_snapshot.json");
-    private static final Path PENDING_VERSION_FILE = CLIENT_STORAGE_DIR.resolve("pending_version.dat");
-    private static final Path SYNC_URL_FILE = CLIENT_STORAGE_DIR.resolve("last_sync_url.txt");
-    private static final Path BACKUP_DIR = CLIENT_STORAGE_DIR.resolve("backup");
+    // ================== 路径分离逻辑 (v3.1.3) ==================
+    // 1. 配置文件路径：config/automodsync/
+    private static final Path CONFIG_ROOT_DIR = FMLPaths.CONFIGDIR.get().resolve("automodsync");
+    // 2. 仓库备份路径：游戏根目录/automodsync_client_storage/ (保持不动)
+    private static final Path WAREHOUSE_ROOT_DIR = FMLPaths.GAMEDIR.get().resolve("automodsync_client_storage");
+
+    // 具体文件指向 Config 目录
+    private static final Path CLIENT_SNAPSHOT_FILE = CONFIG_ROOT_DIR.resolve("client_snapshot.json");
+    private static final Path PENDING_VERSION_FILE = CONFIG_ROOT_DIR.resolve("pending_version.dat");
+    private static final Path SYNC_URL_FILE = CONFIG_ROOT_DIR.resolve("last_sync_url.txt");
+
+    // 备份目录指向 Warehouse 目录
+    private static final Path BACKUP_DIR = WAREHOUSE_ROOT_DIR.resolve("backup");
 
     public static class LocalModInfo { public String fileName; public String hash; public String modId; public boolean isClientOnly; public LocalModInfo(String fileName, String hash, String modId, boolean isClientOnly) { this.fileName = fileName; this.hash = hash; this.modId = modId; this.isClientOnly = isClientOnly; } }
     public static class ClientSnapshot { public int version; public List<LocalModInfo> files = new ArrayList<>(); }
@@ -83,8 +91,12 @@ public class ClientSideManager {
     }
 
     static {
-        try { if (!Files.exists(CLIENT_STORAGE_DIR)) Files.createDirectories(CLIENT_STORAGE_DIR); } catch (IOException e) {}
-        WarehouseManager.init(CLIENT_STORAGE_DIR);
+        // 初始化 Config 目录
+        try { if (!Files.exists(CONFIG_ROOT_DIR)) Files.createDirectories(CONFIG_ROOT_DIR); } catch (IOException e) {}
+        // 初始化 Warehouse 目录 (保持在根目录)
+        try { if (!Files.exists(WAREHOUSE_ROOT_DIR)) Files.createDirectories(WAREHOUSE_ROOT_DIR); } catch (IOException e) {}
+        
+        WarehouseManager.init(WAREHOUSE_ROOT_DIR);
         loadCachedUrl();
     }
 
@@ -111,8 +123,10 @@ public class ClientSideManager {
 
     @SubscribeEvent
     public static void onRegisterClientCommands(RegisterClientCommandsEvent event) {
+        // v3.1.3: 添加 .requires(s -> true) 确保 ClickEvent 有权限执行
         event.getDispatcher().register(
                 net.minecraft.commands.Commands.literal("automodsync_open_gui")
+                        .requires(s -> true)
                         .executes(context -> {
                             Minecraft.getInstance().execute(() -> Minecraft.getInstance().setScreen(new SyncInputScreen(null)));
                             return com.mojang.brigadier.Command.SINGLE_SUCCESS;
@@ -120,6 +134,7 @@ public class ClientSideManager {
         );
         event.getDispatcher().register(
                 net.minecraft.commands.Commands.literal("automodsync_disconnect_update")
+                        .requires(s -> true)
                         .executes(context -> {
                             Minecraft.getInstance().execute(() -> {
                                 if (Minecraft.getInstance().getConnection() != null) {
@@ -138,7 +153,7 @@ public class ClientSideManager {
         new Thread(() -> {
             try {
                 Thread.sleep(20000);
-                WarehouseManager.init(CLIENT_STORAGE_DIR);
+                WarehouseManager.init(WAREHOUSE_ROOT_DIR);
 
                 if (Files.exists(PENDING_VERSION_FILE)) {
                     int verToSave = 0;
@@ -175,10 +190,21 @@ public class ClientSideManager {
                                 saveClientSnapshot(currentFiles, liveServerVersion);
                                 LOGGER.info("AutoModSync: Silent update to V" + liveServerVersion + " (Environment consistent)");
                             } else {
+                                // v3.1.3: 可点击的退出更新提示
                                 Minecraft.getInstance().player.displayClientMessage(
-                                        Component.literal("§b[AutoModSync] §f发现非必要版本更新 (v" + localVer + " -> v" + liveServerVersion + ")，但不影响进入服务器。"),
+                                        Component.literal("§b[AutoModSync] §f发现非必要更新 (v" + localVer + " -> v" + liveServerVersion + ")"),
                                         false
                                 );
+
+                                Component clickToUpdate = Component.literal("§a§l[点击此处退出服务器并更新]")
+                                        .withStyle(net.minecraft.network.chat.Style.EMPTY
+                                                .withClickEvent(new net.minecraft.network.chat.ClickEvent(net.minecraft.network.chat.ClickEvent.Action.SUGGEST_COMMAND, "/automodsync_disconnect_update"))
+                                                .withHoverEvent(new net.minecraft.network.chat.HoverEvent(
+                                                        net.minecraft.network.chat.HoverEvent.Action.SHOW_TEXT,
+                                                        Component.literal("点击后指令将填入下方聊天框，请手动按回车执行")
+                                                )));
+
+                                Minecraft.getInstance().player.displayClientMessage(clickToUpdate, false);
                             }
                         }
                     }
@@ -632,7 +658,7 @@ public class ClientSideManager {
             CompletableFuture.runAsync(() -> {
                 StringBuilder errorLog = new StringBuilder();
                 try {
-                    WarehouseManager.init(CLIENT_STORAGE_DIR);
+                    WarehouseManager.init(WAREHOUSE_ROOT_DIR);
                     if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
                     for (ModActionItem item : actionItems) {
                         if (item.selected && (item.type.equals("SERVER_REMOVED") || item.type.equals("ILLEGAL") || item.type.equals("UPDATE") || item.type.equals("FORCED_DELETE"))) {

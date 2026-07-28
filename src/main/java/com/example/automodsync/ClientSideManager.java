@@ -6,6 +6,7 @@ import com.mojang.logging.LogUtils;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.*;
+import net.minecraft.client.gui.narration.NarrationElementOutput;
 import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
@@ -24,14 +25,16 @@ import net.minecraftforge.forgespi.language.IModInfo;
 import org.slf4j.Logger;
 
 import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -46,7 +49,9 @@ public class ClientSideManager {
     public static final AtomicReference<String> CACHED_SYNC_URL = new AtomicReference<>("");
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    private static int liveServerVersion = 0;
+    private static volatile int liveServerVersion = 0;
+    private static volatile boolean clientLoginEventSeen = false;
+    private static final AtomicInteger CONNECTION_GENERATION = new AtomicInteger();
 
     // ================== 路径分离逻辑 (v3.1.3) ==================
     // 1. 配置文件路径：config/automodsync/
@@ -56,14 +61,39 @@ public class ClientSideManager {
 
     // 具体文件指向 Config 目录
     private static final Path CLIENT_SNAPSHOT_FILE = CONFIG_ROOT_DIR.resolve("client_snapshot.json");
-    private static final Path PENDING_VERSION_FILE = CONFIG_ROOT_DIR.resolve("pending_version.dat");
+    private static final Path PENDING_SYNC_FILE = CONFIG_ROOT_DIR.resolve("pending_sync.json");
+    private static final Path LEGACY_PENDING_VERSION_FILE = CONFIG_ROOT_DIR.resolve("pending_version.dat");
     private static final Path SYNC_URL_FILE = CONFIG_ROOT_DIR.resolve("last_sync_url.txt");
 
     // 备份目录指向 Warehouse 目录
     private static final Path BACKUP_DIR = WAREHOUSE_ROOT_DIR.resolve("backup");
 
-    public static class LocalModInfo { public String fileName; public String hash; public String modId; public boolean isClientOnly; public LocalModInfo(String fileName, String hash, String modId, boolean isClientOnly) { this.fileName = fileName; this.hash = hash; this.modId = modId; this.isClientOnly = isClientOnly; } }
-    public static class ClientSnapshot { public int version; public List<LocalModInfo> files = new ArrayList<>(); }
+    public static class LocalModInfo {
+        public String fileName;
+        /** Legacy SHA-1 field. */
+        public String hash;
+        public String sha256;
+        public long size = -1L;
+        public String modId;
+        public boolean isClientOnly;
+        public List<String> officialUrls = new ArrayList<>();
+        public LocalModInfo(String fileName, String hash, String sha256, long size, String modId, boolean isClientOnly) {
+            this.fileName = fileName; this.hash = hash; this.sha256 = sha256; this.size = size;
+            this.modId = modId; this.isClientOnly = isClientOnly;
+        }
+    }
+    public static class ClientSnapshot {
+        public int version;
+        public String syncUrl;
+        public List<LocalModInfo> files = new ArrayList<>();
+    }
+    public static class PendingSync {
+        public int targetVersion;
+        public String syncUrl;
+        public long completedAt;
+        public List<ServerSideManager.ModInfo> authorityManifest = new ArrayList<>();
+        public List<ServerSideManager.ForcedRule> forcedActions = new ArrayList<>();
+    }
     public static class PatchPacket {
         public int targetVersion;
         public boolean allowFolderDelete;
@@ -76,11 +106,21 @@ public class ClientSideManager {
     public static class ModActionItem {
         String name; Path path; String type; boolean selected; String extraInfo;
         List<ModActionItem> subItems;
+        ServerSideManager.ModInfo modInfo;
+        ServerSideManager.ForcedRule forcedRule;
+        String expectedSha1;
+        String expectedSha256;
+        long expectedSize = -1L;
         public ModActionItem(String name, Path path, String type, boolean defaultSelected) {
             this.name = name; this.path = path; this.type = type; this.selected = defaultSelected;
         }
         public ModActionItem setExtra(String info) { this.extraInfo = info; return this; }
         public ModActionItem setSubItems(List<ModActionItem> subs) { this.subItems = subs; return this; }
+        public ModActionItem setModInfo(ServerSideManager.ModInfo info) { this.modInfo = info; return this; }
+        public ModActionItem setForcedRule(ServerSideManager.ForcedRule rule) { this.forcedRule = rule; return this; }
+        public ModActionItem expect(String sha1, String sha256, long size) {
+            this.expectedSha1 = sha1; this.expectedSha256 = sha256; this.expectedSize = size; return this;
+        }
     }
 
     private static class SyncCalculationResult {
@@ -118,7 +158,9 @@ public class ClientSideManager {
 
     public static void setServerVersion(int ver) {
         liveServerVersion = ver;
+        int generation = CONNECTION_GENERATION.incrementAndGet();
         LOGGER.info("AutoModSync: Received live server version: v" + ver);
+        scheduleConnectionSnapshotRefresh(ver, generation);
     }
 
     @SubscribeEvent
@@ -150,52 +192,57 @@ public class ClientSideManager {
 
     @SubscribeEvent
     public static void onPlayerLogin(ClientPlayerNetworkEvent.LoggingIn event) {
-        new Thread(() -> {
+        clientLoginEventSeen = true;
+        Thread snapshotThread = new Thread(() -> {
             try {
-                Thread.sleep(20000);
+                for (int attempt = 0; attempt < 120 && liveServerVersion <= 0; attempt++) Thread.sleep(1000);
+                boolean stableConnection = waitForStableServerConnection();
                 WarehouseManager.init(WAREHOUSE_ROOT_DIR);
 
-                if (Files.exists(PENDING_VERSION_FILE)) {
-                    int verToSave = 0;
-                    try (BufferedReader br = Files.newBufferedReader(PENDING_VERSION_FILE)) {
-                        String line = br.readLine();
-                        if (line != null) verToSave = Integer.parseInt(line.trim());
-                    } catch (Exception ignored) {}
-                    Files.deleteIfExists(PENDING_VERSION_FILE);
-
-                    if (verToSave > 0) {
-                        List<LocalModInfo> currentFiles = scanLocalMods();
-                        for (LocalModInfo mod : currentFiles) {
-                            WarehouseManager.backupToWarehouse(FMLPaths.MODSDIR.get().resolve(mod.fileName));
-                        }
-                        saveClientSnapshot(currentFiles, verToSave);
-                        LOGGER.info("AutoModSync: Snapshot updated to Pending V" + verToSave);
-                        return;
-                    }
+                if (Files.deleteIfExists(LEGACY_PENDING_VERSION_FILE)) {
+                    LOGGER.warn("AutoModSync: Removed an unverifiable legacy pending_version.dat; a new verified sync is required");
                 }
 
-                ClientSnapshot old = loadSnapshot();
+                PendingSync pending = loadPendingSync();
+                if (stableConnection && pending != null && pending.targetVersion > 0
+                        && liveServerVersion == pending.targetVersion
+                        && sameServerUrl(CACHED_SYNC_URL.get(), pending.syncUrl)) {
+                    List<LocalModInfo> currentFiles = scanLocalMods();
+                    String validationError = validateExpectedEnvironment(currentFiles,
+                            pending.authorityManifest, pending.forcedActions, true);
+                    if (validationError == null) {
+                        mergeOfficialSources(currentFiles, pending.authorityManifest);
+                        backupVerifiedMods(currentFiles);
+                        saveClientSnapshot(currentFiles, pending.targetVersion);
+                        Files.deleteIfExists(PENDING_SYNC_FILE);
+                        LOGGER.info("AutoModSync: Verified and committed snapshot V{}", pending.targetVersion);
+                        return;
+                    }
+                    LOGGER.error("AutoModSync: Pending sync was not committed: {}", validationError);
+                }
+
+                ClientSnapshot old = loadSnapshotForServer(CACHED_SYNC_URL.get());
                 int localVer = (old != null) ? old.version : 1;
 
-                if (liveServerVersion > localVer) {
+                if (liveServerVersion > localVer || old == null) {
                     String url = CACHED_SYNC_URL.get();
                     if (!url.isEmpty()) {
                         SyncCalculationResult result = calculateSyncPlan(url, localVer);
                         if (result != null) {
                             if (result.actions.isEmpty()) {
                                 List<LocalModInfo> currentFiles = scanLocalMods();
-                                for (LocalModInfo mod : currentFiles) {
-                                    WarehouseManager.backupToWarehouse(FMLPaths.MODSDIR.get().resolve(mod.fileName));
+                                String validationError = validateExpectedEnvironment(currentFiles,
+                                        result.packet.authorityManifest, result.packet.forcedActions, stableConnection);
+                                if (validationError == null) {
+                                    mergeOfficialSources(currentFiles, result.packet.authorityManifest);
+                                    backupVerifiedMods(currentFiles);
+                                    saveClientSnapshot(currentFiles, result.packet.targetVersion);
+                                    LOGGER.info("AutoModSync: Verified silent update to V{}", result.packet.targetVersion);
+                                } else {
+                                    LOGGER.error("AutoModSync: Refused silent snapshot: {}", validationError);
                                 }
-                                saveClientSnapshot(currentFiles, liveServerVersion);
-                                LOGGER.info("AutoModSync: Silent update to V" + liveServerVersion + " (Environment consistent)");
                             } else {
                                 // v3.1.3: 可点击的退出更新提示
-                                Minecraft.getInstance().player.displayClientMessage(
-                                        Component.literal("§b[AutoModSync] §f发现非必要更新 (v" + localVer + " -> v" + liveServerVersion + ")"),
-                                        false
-                                );
-
                                 Component clickToUpdate = Component.literal("§a§l[点击此处退出服务器并更新]")
                                         .withStyle(net.minecraft.network.chat.Style.EMPTY
                                                 .withClickEvent(new net.minecraft.network.chat.ClickEvent(net.minecraft.network.chat.ClickEvent.Action.SUGGEST_COMMAND, "/automodsync_disconnect_update"))
@@ -203,21 +250,98 @@ public class ClientSideManager {
                                                         net.minecraft.network.chat.HoverEvent.Action.SHOW_TEXT,
                                                         Component.literal("点击后指令将填入下方聊天框，请手动按回车执行")
                                                 )));
-
-                                Minecraft.getInstance().player.displayClientMessage(clickToUpdate, false);
+                                Minecraft.getInstance().execute(() -> {
+                                    if (Minecraft.getInstance().player != null) {
+                                        Minecraft.getInstance().player.displayClientMessage(
+                                                Component.literal("§b[AutoModSync] §f发现需要同步 (v" + localVer + " -> v" + liveServerVersion + ")"), false);
+                                        Minecraft.getInstance().player.displayClientMessage(clickToUpdate, false);
+                                    }
+                                });
                             }
                         }
                     }
-                } else if (old == null) {
-                    List<LocalModInfo> currentFiles = scanLocalMods();
-                    for (LocalModInfo mod : currentFiles) {
-                        WarehouseManager.backupToWarehouse(FMLPaths.MODSDIR.get().resolve(mod.fileName));
-                    }
-                    saveClientSnapshot(currentFiles, (liveServerVersion > 0) ? liveServerVersion : 1);
                 }
 
             } catch (Exception e) { e.printStackTrace(); }
-        }, "ModSync-Snapshot-Thread").start();
+        }, "ModSync-Snapshot-Thread");
+        snapshotThread.setDaemon(true);
+        snapshotThread.start();
+    }
+
+    @SubscribeEvent
+    public static void onPlayerLogout(ClientPlayerNetworkEvent.LoggingOut event) {
+        clientLoginEventSeen = false;
+        liveServerVersion = 0;
+        CONNECTION_GENERATION.incrementAndGet();
+    }
+
+    private static void scheduleConnectionSnapshotRefresh(int expectedVersion, int generation) {
+        Thread refreshThread = new Thread(() -> {
+            try {
+                if (!waitForStableServerConnection()) {
+                    LOGGER.warn("AutoModSync: Compatible snapshot was not refreshed because the connection did not remain stable");
+                    return;
+                }
+                if (generation != CONNECTION_GENERATION.get() || liveServerVersion != expectedVersion) return;
+
+                String syncUrl = CACHED_SYNC_URL.get();
+                if (syncUrl == null || syncUrl.isBlank()) {
+                    LOGGER.warn("AutoModSync: Compatible snapshot was not refreshed because no sync URL was received");
+                    return;
+                }
+                ClientSnapshot previous = loadSnapshotForServer(syncUrl);
+                int localVersion = previous == null ? 1 : previous.version;
+                SyncCalculationResult result = calculateSyncPlan(syncUrl, localVersion);
+                if (result == null || result.packet == null || result.packet.targetVersion != expectedVersion) {
+                    LOGGER.warn("AutoModSync: Compatible snapshot was not refreshed because the authority manifest was unavailable");
+                    return;
+                }
+
+                List<LocalModInfo> currentFiles = scanLocalMods();
+                String validationError = validateExpectedEnvironment(currentFiles,
+                        result.packet.authorityManifest, result.packet.forcedActions, true);
+                if (validationError != null) {
+                    LOGGER.error("AutoModSync: Refused compatible environment refresh: {}", validationError);
+                    return;
+                }
+                if (generation != CONNECTION_GENERATION.get() || !isConnectionProofFor(syncUrl, expectedVersion)) return;
+
+                mergeOfficialSources(currentFiles, result.packet.authorityManifest);
+                backupVerifiedMods(currentFiles);
+                saveClientSnapshot(currentFiles, expectedVersion);
+                LOGGER.info("AutoModSync: Refreshed compatible local environment for V{} with {} files",
+                        expectedVersion, currentFiles.size());
+            } catch (Exception e) {
+                LOGGER.error("AutoModSync: Compatible snapshot refresh failed", e);
+            }
+        }, "ModSync-Compatible-Snapshot");
+        refreshThread.setDaemon(true);
+        refreshThread.start();
+    }
+
+    private static boolean waitForStableServerConnection() throws InterruptedException {
+        int stableChecks = 0;
+        for (int attempt = 0; attempt < 50; attempt++) {
+            if (hasActiveServerConnection()) {
+                stableChecks++;
+                if (stableChecks >= 30) return true;
+            } else {
+                stableChecks = 0;
+            }
+            Thread.sleep(100);
+        }
+        return false;
+    }
+
+    private static boolean hasActiveServerConnection() {
+        Minecraft minecraft = Minecraft.getInstance();
+        return clientLoginEventSeen && minecraft.getConnection() != null;
+    }
+
+    private static boolean isConnectionProofFor(String syncUrl, int targetVersion) {
+        return hasActiveServerConnection()
+                && liveServerVersion == targetVersion
+                && sameServerUrl(CACHED_SYNC_URL.get(), syncUrl);
     }
 
     @SubscribeEvent
@@ -241,7 +365,7 @@ public class ClientSideManager {
 
     private static void analyzeDiff(String rawUrl, SyncInputScreen inputScreen) {
         try {
-            ClientSnapshot snapshot = loadSnapshot();
+            ClientSnapshot snapshot = loadSnapshotForServer(rawUrl);
             int localVersion = (snapshot != null) ? snapshot.version : 1;
             SyncCalculationResult result = calculateSyncPlan(rawUrl, localVersion);
 
@@ -249,8 +373,6 @@ public class ClientSideManager {
                 inputScreen.resetState("连接失败: 无法获取清单");
                 return;
             }
-
-            try (BufferedWriter bw = Files.newBufferedWriter(PENDING_VERSION_FILE)) { bw.write(String.valueOf(result.packet.targetVersion)); } catch (IOException ignored) {}
 
             final boolean showWarning = result.actions.size() > 5;
 
@@ -266,30 +388,22 @@ public class ClientSideManager {
 
     private static SyncCalculationResult calculateSyncPlan(String rawUrl, int localVersion) {
         try {
-            String baseUrl = rawUrl.trim();
-            boolean isIPv6 = baseUrl.chars().filter(ch -> ch == ':').count() > 1;
-            boolean hasBrackets = baseUrl.contains("[") && baseUrl.contains("]");
-            if (isIPv6 && !hasBrackets) {
-                if (baseUrl.startsWith("http://")) baseUrl = "http://[" + baseUrl.substring(7) + "]";
-                else if (baseUrl.startsWith("https://")) baseUrl = "https://[" + baseUrl.substring(8) + "]";
-                else baseUrl = "http://[" + baseUrl + "]";
-            } else {
-                if (!baseUrl.startsWith("http")) baseUrl = "http://" + baseUrl;
-            }
-            if (!baseUrl.endsWith("/")) baseUrl += "/";
+            String baseUrl = normalizeBaseUrl(rawUrl);
 
-            ClientSnapshot snapshot = loadSnapshot();
+            ClientSnapshot snapshot = loadSnapshotForServer(baseUrl);
             Map<String, LocalModInfo> snapshotMap = new HashMap<>();
             if (snapshot != null && snapshot.files != null) {
                 for (LocalModInfo info : snapshot.files) snapshotMap.put(info.fileName, info);
             }
             boolean hasSnapshot = !snapshotMap.isEmpty();
-            boolean isPendingState = Files.exists(PENDING_VERSION_FILE);
+            boolean isPendingState = Files.exists(PENDING_SYNC_FILE);
 
             String json = downloadString(new URL(baseUrl + "diff?ver=" + localVersion));
             if (json == null) return null;
 
             PatchPacket packet = GSON.fromJson(json, PatchPacket.class);
+            validatePatchPacket(packet);
+            boolean provenByCurrentConnection = isConnectionProofFor(baseUrl, packet.targetVersion);
             List<LocalModInfo> localScanList = scanLocalMods();
             Map<String, LocalModInfo> localMap = new HashMap<>();
             for (LocalModInfo info : localScanList) localMap.put(info.fileName, info);
@@ -311,8 +425,9 @@ public class ClientSideManager {
                     if (rule.target == null) continue;
                     Path p = Paths.get(rule.target);
                     String fname = p.getFileName().toString();
-                    if ("ADD".equals(rule.action)) forcedAddTargets.add(fname);
-                    if ("DELETE".equals(rule.action)) forcedDeleteTargets.add(fname);
+                    String normalizedTarget = rule.target.replace('\\', '/');
+                    if (normalizedTarget.startsWith("mods/") && "ADD".equals(rule.action)) forcedAddTargets.add(fname);
+                    if (normalizedTarget.startsWith("mods/") && "DELETE".equals(rule.action)) forcedDeleteTargets.add(fname);
                 }
             }
 
@@ -325,13 +440,19 @@ public class ClientSideManager {
             else if (isPendingState) { res.status1 = "§e[本地校验] 等待进服"; }
             else {
                 boolean isConsistent = true;
-                for (String snapFile : snapshotMap.keySet()) {
-                    if (!localMap.containsKey(snapFile)) {
+                for (Map.Entry<String, LocalModInfo> snapshotEntry : snapshotMap.entrySet()) {
+                    String snapFile = snapshotEntry.getKey();
+                    LocalModInfo expected = snapshotEntry.getValue();
+                    if (ModSyncMain.MODID.equals(expected.modId)) continue;
+                    LocalModInfo actual = localMap.get(snapFile);
+                    boolean matches = actual != null && sameFile(expected.hash, expected.sha256, expected.size,
+                            actual.hash, actual.sha256, actual.size);
+                    if (!matches) {
                         isConsistent = false;
-                        if (WarehouseManager.isInWarehouse(snapFile)) {
-                            actionItems.add(new ModActionItem(snapFile, null, "RESTORE", true));
-                            processedFiles.add(snapFile);
-                        }
+                        actionItems.add(new ModActionItem(snapFile,
+                                actual == null ? null : localModsDir.resolve(snapFile), "RESTORE", true)
+                                .expect(expected.hash, expected.sha256, expected.size));
+                        processedFiles.add(snapFile);
                     }
                 }
                 res.status1 = isConsistent ? "§a[本地校验] 状态正常" : "§c[本地校验] 状态异常";
@@ -343,25 +464,34 @@ public class ClientSideManager {
             if (packet.forcedActions != null) {
                 for (ServerSideManager.ForcedRule rule : packet.forcedActions) {
                     if ("IGNORE".equals(rule.action)) continue;
-                    if (rule.target == null || rule.target.contains("..")) continue;
-                    Path targetPath = gameDir.resolve(rule.target);
+                    if (rule.target == null) continue;
+                    Path targetPath = IntegrityUtil.safeResolve(gameDir, rule.target, false);
                     String displayName = rule.target;
 
                     if ("DELETE".equals(rule.action)) {
+                        String targetFileName = targetPath.getFileName().toString();
+                        actionItems.removeIf(i -> i.type.equals("RESTORE") && i.name.equals(targetFileName));
+                        if (displayName.replace('\\', '/').startsWith("mods/")) processedFiles.add(targetFileName);
                         if (Files.exists(targetPath)) {
-                            actionItems.removeIf(i -> i.type.equals("RESTORE") && i.name.equals(targetPath.getFileName().toString()));
-                            actionItems.add(new ModActionItem(displayName, targetPath, "FORCED_DELETE", true));
+                            if (Files.isDirectory(targetPath) && !packet.allowFolderDelete) {
+                                throw new IOException("服务端请求删除目录，但客户端安全标志未授权: " + displayName);
+                            }
+                            actionItems.add(new ModActionItem(displayName, targetPath, "FORCED_DELETE", true).setForcedRule(rule));
                             forcedCount++;
-                            if (displayName.startsWith("mods/")) processedFiles.add(targetPath.getFileName().toString());
                         }
                     } else if ("ADD".equals(rule.action)) {
+                        if (displayName.replace('\\', '/').startsWith("mods/")) {
+                            String targetFileName = targetPath.getFileName().toString();
+                            actionItems.removeIf(i -> i.type.equals("RESTORE") && i.name.equals(targetFileName));
+                            processedFiles.add(targetFileName);
+                        }
                         boolean needUpdate = true;
                         if (Files.exists(targetPath)) {
-                            String localHash = calculateHash(targetPath.toFile());
-                            if (localHash.equals(rule.hash)) needUpdate = false;
+                            if (IntegrityUtil.matches(targetPath, rule.hash, rule.sha256, rule.size)) needUpdate = false;
                         }
                         if (needUpdate) {
-                            ModActionItem item = new ModActionItem(displayName, targetPath, "FORCED_OVERWRITE", true).setExtra(rule.source);
+                            ModActionItem item = new ModActionItem(displayName, targetPath, "FORCED_OVERWRITE", true)
+                                    .setExtra(rule.source).setForcedRule(rule).expect(rule.hash, rule.sha256, rule.size);
                             Path parent = Paths.get(rule.target).getParent();
                             if (parent != null) {
                                 String parentKey = parent.toString().replace("\\", "/");
@@ -370,7 +500,6 @@ public class ClientSideManager {
                                 actionItems.add(item);
                             }
                             forcedCount++;
-                            if (displayName.startsWith("mods/")) processedFiles.add(targetPath.getFileName().toString());
                         }
                     }
                 }
@@ -394,10 +523,14 @@ public class ClientSideManager {
                 res.status2 = "§c[版本同步] 有新版本";
                 if (packet.toRemove != null) {
                     for (String fileToRemove : packet.toRemove) {
+                        boolean restorePending = actionItems.stream().anyMatch(
+                                i -> i.type.equals("RESTORE") && i.name.equals(fileToRemove));
+                        if (processedFiles.contains(fileToRemove) && !restorePending) continue;
+                        actionItems.removeIf(i -> i.type.equals("RESTORE") && i.name.equals(fileToRemove));
+                        processedFiles.add(fileToRemove);
                         if (localMap.containsKey(fileToRemove)) {
-                            actionItems.removeIf(i -> i.type.equals("RESTORE") && i.name.equals(fileToRemove));
-                            actionItems.add(new ModActionItem(fileToRemove, localModsDir.resolve(fileToRemove), "SERVER_REMOVED", true));
-                            processedFiles.add(fileToRemove);
+                            actionItems.add(new ModActionItem(fileToRemove,
+                                    IntegrityUtil.safeResolve(localModsDir, fileToRemove, false), "SERVER_REMOVED", true));
                         }
                     }
                 }
@@ -407,16 +540,22 @@ public class ClientSideManager {
                         if (forcedAddTargets.contains(info.fileName)) continue;
 
                         if (localMap.containsKey(info.fileName)) {
-                            if (!localMap.get(info.fileName).hash.equals(info.hash)) {
-                                actionItems.add(new ModActionItem(info.fileName, localModsDir.resolve(info.fileName), "UPDATE", true));
+                            LocalModInfo localInfo = localMap.get(info.fileName);
+                            if (!sameFile(info.hash, info.sha256, info.size,
+                                    localInfo.hash, localInfo.sha256, localInfo.size)) {
+                                actionItems.add(new ModActionItem(info.fileName,
+                                        IntegrityUtil.safeResolve(localModsDir, info.fileName, false), "UPDATE", true)
+                                        .setModInfo(info).expect(info.hash, info.sha256, info.size));
                                 processedFiles.add(info.fileName);
                             } else { processedFiles.add(info.fileName); }
                         } else {
-                            actionItems.add(new ModActionItem(info.fileName, null, "NEW", true));
+                            actionItems.add(new ModActionItem(info.fileName, null, "NEW", true)
+                                    .setModInfo(info).expect(info.hash, info.sha256, info.size));
                             processedFiles.add(info.fileName);
                             for (LocalModInfo local : localScanList) {
                                 if (local.modId != null && local.modId.equals(info.modId) && !local.fileName.equals(info.fileName)) {
-                                    actionItems.add(new ModActionItem(local.fileName, localModsDir.resolve(local.fileName), "UPDATE", true));
+                                    actionItems.add(new ModActionItem(local.fileName,
+                                            IntegrityUtil.safeResolve(localModsDir, local.fileName, false), "SERVER_REMOVED", true));
                                     processedFiles.add(local.fileName);
                                 }
                             }
@@ -425,56 +564,43 @@ public class ClientSideManager {
                 }
             }
 
-            // Step 3: Authority Check
-            if (!hasSnapshot) {
-                res.status3 = "§7[整体校验] 暂未开启";
-            } else {
-                Set<String> authoritySet = new HashSet<>();
-                Set<String> serverModIds = new HashSet<>();
-                if (packet.authorityManifest != null) {
-                    for (ServerSideManager.ModInfo m : packet.authorityManifest) {
-                        authoritySet.add(m.fileName);
-                        if (m.modId != null) serverModIds.add(m.modId);
+            // Step 3: authoritative filename + size + SHA-1/SHA-256 validation.
+            Set<String> authoritySet = new HashSet<>();
+            for (ServerSideManager.ModInfo m : packet.authorityManifest) authoritySet.add(m.fileName);
+            boolean integrityPassed = true;
+            for (ServerSideManager.ModInfo info : packet.authorityManifest) {
+                if (!info.isServerRequired || forcedAddTargets.contains(info.fileName)
+                        || forcedDeleteTargets.contains(info.fileName)
+                        || matchesIgnore(ignorePatterns, info.fileName, info.modId)) continue;
+                LocalModInfo actual = localMap.get(info.fileName);
+                boolean exact = actual != null && sameFile(info.hash, info.sha256, info.size,
+                        actual.hash, actual.sha256, actual.size);
+                if (!exact) {
+                    boolean isCovered = hasPlannedAuthorityResult(actionItems, info);
+                    if (!isCovered) {
+                        String type = actual == null ? "NEW" : "UPDATE";
+                        actionItems.add(new ModActionItem(info.fileName,
+                                actual == null ? null : IntegrityUtil.safeResolve(localModsDir, info.fileName, false), type, true)
+                                .setModInfo(info).expect(info.hash, info.sha256, info.size));
                     }
+                    if (!hasPlannedAuthorityResult(actionItems, info)) integrityPassed = false;
                 }
-                boolean integrityPassed = true;
-
-                if (!authoritySet.isEmpty()) {
-                    for (ServerSideManager.ModInfo info : packet.authorityManifest) {
-                        if (forcedAddTargets.contains(info.fileName)) continue;
-                        if (forcedDeleteTargets.contains(info.fileName)) continue;
-                        if (ignorePatterns.stream().anyMatch(p -> info.fileName.contains(p) || info.modId.contains(p))) continue;
-
-                        if (info.isServerRequired && !localMap.containsKey(info.fileName)) {
-                            boolean isPending = actionItems.stream().anyMatch(i -> i.name.equals(info.fileName));
-                            if (!isPending) {
-                                actionItems.add(new ModActionItem(info.fileName, null, "NEW", true));
-                                integrityPassed = false;
-                            }
-                        }
-                    }
-                    for (LocalModInfo localFile : localScanList) {
-                        String fileName = localFile.fileName;
-
-                        if (processedFiles.contains(fileName)) continue;
-                        if (actionItems.stream().anyMatch(i -> i.name.equals(fileName))) continue;
-                        if (fileName.contains("automodsync")) continue;
-                        if (forcedAddTargets.contains(fileName)) continue;
-                        if (authoritySet.contains(fileName)) continue;
-                        if (ignorePatterns.stream().anyMatch(p -> fileName.contains(p) || (localFile.modId != null && localFile.modId.contains(p)))) continue;
-                        if (localFile.isClientOnly) continue;
-
-                        // 🟢 [新增] 快照回溯：如果上一次成功进服时有这个文件，则视为合法
-                        if (snapshotMap.containsKey(fileName)) {
-                            continue;
-                        }
-
-                        actionItems.add(new ModActionItem(fileName, localModsDir.resolve(fileName), "ILLEGAL", true));
-                        integrityPassed = false;
-                    }
-                }
-                res.status3 = integrityPassed ? "§a[整体校验] 校验通过" : "§c[整体校验] 校验异常";
             }
+            for (LocalModInfo localFile : localScanList) {
+                String fileName = localFile.fileName;
+                if (processedFiles.contains(fileName) || actionItems.stream().anyMatch(i -> i.name.equals(fileName))) continue;
+                if (ModSyncMain.MODID.equals(localFile.modId)) continue;
+                if (forcedAddTargets.contains(fileName) || authoritySet.contains(fileName)) continue;
+                if (matchesIgnore(ignorePatterns, fileName, localFile.modId)) continue;
+                LocalModInfo approved = snapshotMap.get(fileName);
+                if (approved != null && sameFile(approved.hash, approved.sha256, approved.size,
+                        localFile.hash, localFile.sha256, localFile.size)) continue;
+                if (provenByCurrentConnection) continue;
+                if (!hasSnapshot && localFile.isClientOnly) continue;
+                actionItems.add(new ModActionItem(fileName,
+                        IntegrityUtil.safeResolve(localModsDir, fileName, false), "LOCAL_UNVERIFIED", true));
+            }
+            res.status3 = integrityPassed ? "§a[整体校验] 计划校验通过" : "§c[整体校验] 计划存在遗漏";
 
             res.actions = actionItems;
             return res;
@@ -482,11 +608,31 @@ public class ClientSideManager {
         } catch (Exception e) { e.printStackTrace(); return null; }
     }
 
+    private static boolean hasPlannedAuthorityResult(List<ModActionItem> actions, ServerSideManager.ModInfo expected) {
+        for (ModActionItem item : actions) {
+            List<ModActionItem> candidates = item.subItems == null ? Collections.singletonList(item) : item.subItems;
+            for (ModActionItem candidate : candidates) {
+                if (!expected.fileName.equals(candidate.name)) continue;
+                if (!(candidate.type.equals("NEW") || candidate.type.equals("UPDATE") || candidate.type.equals("RESTORE"))) continue;
+                if (sameFile(expected.hash, expected.sha256, expected.size,
+                        candidate.expectedSha1, candidate.expectedSha256, candidate.expectedSize)) return true;
+            }
+        }
+        return false;
+    }
+
     private static List<LocalModInfo> scanLocalMods() {
         List<LocalModInfo> list = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(FMLPaths.MODSDIR.get(), "*.jar")) {
             for (Path path : stream) {
-                list.add(new LocalModInfo(path.getFileName().toString(), calculateHash(path.toFile()), getModId(path), checkClientOnlyComprehensive(path)));
+                if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) continue;
+                try {
+                    IntegrityUtil.Hashes hashes = IntegrityUtil.hash(path);
+                    list.add(new LocalModInfo(path.getFileName().toString(), hashes.sha1(), hashes.sha256(), hashes.size(),
+                            getModId(path), checkClientOnlyComprehensive(path)));
+                } catch (IOException e) {
+                    LOGGER.error("AutoModSync: Could not hash local mod {}", path, e);
+                }
             }
         } catch (IOException e) { e.printStackTrace(); }
         return list;
@@ -542,21 +688,344 @@ public class ClientSideManager {
         return false;
     }
 
-    private static void saveClientSnapshot(List<LocalModInfo> files, int version) { try (Writer w = Files.newBufferedWriter(CLIENT_SNAPSHOT_FILE)) { ClientSnapshot s = new ClientSnapshot(); s.version = version; s.files = files; GSON.toJson(s, w); } catch (IOException e) {} }
-    private static ClientSnapshot loadSnapshot() { if(!Files.exists(CLIENT_SNAPSHOT_FILE)) return null; try(Reader r = Files.newBufferedReader(CLIENT_SNAPSHOT_FILE)) { return GSON.fromJson(r, ClientSnapshot.class); } catch(Exception e) { return null; } }
-    private static String downloadString(URL url) { try(Scanner s = new Scanner(url.openStream(), StandardCharsets.UTF_8)) { s.useDelimiter("\\A"); return s.hasNext() ? s.next() : null; } catch(IOException e) { return null; } }
+    private static synchronized void saveClientSnapshot(List<LocalModInfo> files, int version) throws IOException {
+        if (version <= 0 || files == null) throw new IOException("Invalid snapshot");
+        ClientSnapshot snapshot = new ClientSnapshot();
+        snapshot.version = version;
+        String currentUrl = CACHED_SYNC_URL.get();
+        if (currentUrl != null && !currentUrl.isBlank()) snapshot.syncUrl = normalizeBaseUrl(currentUrl);
+        snapshot.files = files.stream()
+                .filter(info -> !ModSyncMain.MODID.equals(info.modId))
+                .collect(Collectors.toCollection(ArrayList::new));
+        snapshot.files.sort(Comparator.comparing(info -> info.fileName));
+        Path temp = CLIENT_SNAPSHOT_FILE.resolveSibling(CLIENT_SNAPSHOT_FILE.getFileName() + ".tmp");
+        Files.writeString(temp, GSON.toJson(snapshot), StandardCharsets.UTF_8);
+        moveAtomically(temp, CLIENT_SNAPSHOT_FILE);
+    }
 
-    private static void downloadFile(URL url, Path target) throws IOException {
-        try(InputStream in = url.openStream()) {
-            Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            System.out.println("[AutoModSync] Critical Error: Failed to access URL -> " + url.toString());
-            LOGGER.error("AutoModSync: Failed to download from URL: " + url.toString());
-            throw e;
+    private static ClientSnapshot loadSnapshot() {
+        if (!Files.isRegularFile(CLIENT_SNAPSHOT_FILE)) return null;
+        try (Reader reader = Files.newBufferedReader(CLIENT_SNAPSHOT_FILE, StandardCharsets.UTF_8)) {
+            ClientSnapshot snapshot = GSON.fromJson(reader, ClientSnapshot.class);
+            if (snapshot == null || snapshot.version <= 0 || snapshot.files == null || snapshot.files.size() > 10000) return null;
+            Set<String> names = new HashSet<>();
+            for (LocalModInfo info : snapshot.files) {
+                IntegrityUtil.normalizeFileName(info.fileName);
+                if (!names.add(info.fileName) || !IntegrityUtil.isHash(info.hash, 40)) return null;
+                if (info.sha256 != null && !info.sha256.isBlank() && !IntegrityUtil.isHash(info.sha256, 64)) return null;
+                if (info.size == 0 && (info.sha256 == null || info.sha256.isBlank())) info.size = -1L;
+                if (info.officialUrls == null) info.officialUrls = new ArrayList<>();
+            }
+            return snapshot;
+        } catch (Exception e) {
+            LOGGER.error("AutoModSync: Ignored malformed client snapshot", e);
+            return null;
         }
     }
 
-    private static String calculateHash(File file) { try(FileInputStream fis = new FileInputStream(file)) { MessageDigest d = MessageDigest.getInstance("SHA-1"); byte[] b = new byte[4096]; int n; while((n=fis.read(b))!=-1) d.update(b,0,n); StringBuilder s = new StringBuilder(); for(byte by:d.digest()) s.append(String.format("%02x",by)); return s.toString(); } catch(Exception e){return "";} }
+    private static ClientSnapshot loadSnapshotForServer(String syncUrl) {
+        ClientSnapshot snapshot = loadSnapshot();
+        if (snapshot == null) return null;
+        // Legacy snapshots had no URL. Keep them usable until the next successful connection rewrites the file.
+        if (snapshot.syncUrl == null || snapshot.syncUrl.isBlank()) return snapshot;
+        return sameServerUrl(snapshot.syncUrl, syncUrl) ? snapshot : null;
+    }
+
+    private static void savePendingSync(PatchPacket packet, String syncUrl) throws IOException {
+        PendingSync pending = new PendingSync();
+        pending.targetVersion = packet.targetVersion;
+        pending.syncUrl = normalizeBaseUrl(syncUrl);
+        pending.completedAt = System.currentTimeMillis();
+        pending.authorityManifest = packet.authorityManifest;
+        pending.forcedActions = packet.forcedActions;
+        Path temp = PENDING_SYNC_FILE.resolveSibling(PENDING_SYNC_FILE.getFileName() + ".tmp");
+        Files.writeString(temp, GSON.toJson(pending), StandardCharsets.UTF_8);
+        moveAtomically(temp, PENDING_SYNC_FILE);
+    }
+
+    private static PendingSync loadPendingSync() {
+        if (!Files.isRegularFile(PENDING_SYNC_FILE)) return null;
+        try (Reader reader = Files.newBufferedReader(PENDING_SYNC_FILE, StandardCharsets.UTF_8)) {
+            PendingSync pending = GSON.fromJson(reader, PendingSync.class);
+            PatchPacket packet = new PatchPacket();
+            packet.targetVersion = pending.targetVersion;
+            packet.authorityManifest = pending.authorityManifest;
+            packet.forcedActions = pending.forcedActions;
+            packet.toDownload = new ArrayList<>();
+            packet.toRemove = new ArrayList<>();
+            validatePatchPacket(packet);
+            normalizeBaseUrl(pending.syncUrl);
+            return pending;
+        } catch (Exception e) {
+            LOGGER.error("AutoModSync: Ignored malformed pending sync transaction", e);
+            return null;
+        }
+    }
+
+    private static String downloadString(URL url) {
+        HttpURLConnection connection = null;
+        try {
+            if (!("http".equalsIgnoreCase(url.getProtocol()) || "https".equalsIgnoreCase(url.getProtocol()))
+                    || url.getUserInfo() != null) return null;
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(8000);
+            connection.setReadTimeout(15000);
+            connection.setInstanceFollowRedirects(false);
+            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("User-Agent", "AutoModSync/3.2");
+            if (connection.getResponseCode() != 200) return null;
+            long length = connection.getContentLengthLong();
+            if (length > 4 * 1024 * 1024) return null;
+            try (InputStream in = connection.getInputStream(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] buffer = new byte[8192];
+                int total = 0;
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    total += read;
+                    if (total > 4 * 1024 * 1024) return null;
+                    out.write(buffer, 0, read);
+                }
+                return out.toString(StandardCharsets.UTF_8);
+            }
+        } catch (IOException e) {
+            LOGGER.warn("AutoModSync: Failed to download diff: {}", e.getMessage());
+            return null;
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    private static void validatePatchPacket(PatchPacket packet) throws IOException {
+        if (packet == null || packet.targetVersion <= 0) throw new IOException("清单版本无效");
+        if (packet.toDownload == null) packet.toDownload = new ArrayList<>();
+        if (packet.toRemove == null) packet.toRemove = new ArrayList<>();
+        if (packet.forcedActions == null) packet.forcedActions = new ArrayList<>();
+        if (packet.authorityManifest == null) packet.authorityManifest = new ArrayList<>();
+        if (packet.toDownload.size() > 10000 || packet.toRemove.size() > 10000
+                || packet.forcedActions.size() > 20000 || packet.authorityManifest.size() > 10000) {
+            throw new IOException("清单条目数量超出安全限制");
+        }
+        Set<String> authorityNames = new HashSet<>();
+        Map<String, ServerSideManager.ModInfo> authority = new HashMap<>();
+        for (ServerSideManager.ModInfo info : packet.authorityManifest) {
+            validateModInfo(info);
+            if (!authorityNames.add(info.fileName)) throw new IOException("权威清单存在重复文件: " + info.fileName);
+            authority.put(info.fileName, info);
+        }
+        Set<String> removals = new HashSet<>();
+        for (String name : packet.toRemove) {
+            IntegrityUtil.normalizeFileName(name);
+            if (!removals.add(name)) throw new IOException("删除清单存在重复文件: " + name);
+        }
+        Set<String> downloads = new HashSet<>();
+        for (ServerSideManager.ModInfo info : packet.toDownload) {
+            validateModInfo(info);
+            ServerSideManager.ModInfo expected = authority.get(info.fileName);
+            if (expected == null || !sameFile(info.hash, info.sha256, info.size,
+                    expected.hash, expected.sha256, expected.size)) {
+                throw new IOException("下载条目不属于权威清单: " + info.fileName);
+            }
+            if (!downloads.add(info.fileName)) throw new IOException("下载清单存在重复文件: " + info.fileName);
+        }
+        Set<String> addTargets = new HashSet<>();
+        Set<String> deleteTargets = new HashSet<>();
+        for (ServerSideManager.ForcedRule rule : packet.forcedActions) {
+            if (rule == null || rule.action == null) throw new IOException("空的强制规则");
+            String action = rule.action.toUpperCase(Locale.ROOT);
+            if (action.equals("IGNORE")) {
+                if (rule.target == null || rule.target.isBlank() || rule.target.length() > 200
+                        || rule.target.contains("..") || rule.target.indexOf('\0') >= 0) {
+                    throw new IOException("非法 IGNORE 规则");
+                }
+                continue;
+            }
+            IntegrityUtil.safeResolve(FMLPaths.GAMEDIR.get(), rule.target, false);
+            if (action.equals("ADD")) {
+                IntegrityUtil.safeResolve(Path.of("forced-root"), rule.source, false);
+                if (rule.size == 0 && (rule.sha256 == null || rule.sha256.isBlank())) rule.size = -1L;
+                validateHashes(rule.hash, rule.sha256, rule.size, rule.target);
+                if (!addTargets.add(rule.target) || deleteTargets.contains(rule.target)) {
+                    throw new IOException("冲突的强制目标: " + rule.target);
+                }
+            } else if (action.equals("DELETE")) {
+                if (!deleteTargets.add(rule.target) || addTargets.contains(rule.target)) {
+                    throw new IOException("冲突的强制目标: " + rule.target);
+                }
+            } else {
+                throw new IOException("未知强制动作: " + rule.action);
+            }
+        }
+        Path gameRoot = FMLPaths.GAMEDIR.get();
+        for (String add : addTargets) {
+            Path addPath = IntegrityUtil.safeResolve(gameRoot, add, false);
+            for (String delete : deleteTargets) {
+                Path deletePath = IntegrityUtil.safeResolve(gameRoot, delete, false);
+                if (addPath.startsWith(deletePath) || deletePath.startsWith(addPath)) {
+                    throw new IOException("强制新增与删除路径重叠: " + add + " / " + delete);
+                }
+            }
+        }
+    }
+
+    private static void validateModInfo(ServerSideManager.ModInfo info) throws IOException {
+        if (info == null) throw new IOException("空模组记录");
+        IntegrityUtil.normalizeFileName(info.fileName);
+        if (info.modId == null || info.modId.isBlank() || info.modId.length() > 256) throw new IOException("模组 ID 无效");
+        if (info.size == 0 && (info.sha256 == null || info.sha256.isBlank())) info.size = -1L;
+        validateHashes(info.hash, info.sha256, info.size, info.fileName);
+        if (info.officialUrls == null) info.officialUrls = new ArrayList<>();
+        if (info.officialUrls.size() > 8) throw new IOException("官方源数量过多: " + info.fileName);
+        for (String url : info.officialUrls) {
+            if (!OfficialSourceResolver.isAllowedOfficialUrl(url)) throw new IOException("非法官方源: " + info.fileName);
+        }
+    }
+
+    private static void validateHashes(String sha1, String sha256, long size, String name) throws IOException {
+        if (!IntegrityUtil.isHash(sha1, 40)) throw new IOException("SHA-1 无效: " + name);
+        if (sha256 != null && !sha256.isBlank() && !IntegrityUtil.isHash(sha256, 64)) {
+            throw new IOException("SHA-256 无效: " + name);
+        }
+        if (size == 0 || size > IntegrityUtil.MAX_DOWNLOAD_BYTES || size < -1) throw new IOException("文件大小无效: " + name);
+    }
+
+    private static boolean sameFile(String expectedSha1, String expectedSha256, long expectedSize,
+                                    String actualSha1, String actualSha256, long actualSize) {
+        if (!IntegrityUtil.isHash(expectedSha1, 40) || !expectedSha1.equalsIgnoreCase(actualSha1)) return false;
+        if (IntegrityUtil.isHash(expectedSha256, 64)
+                && !expectedSha256.equalsIgnoreCase(Objects.toString(actualSha256, ""))) return false;
+        return expectedSize < 0 || expectedSize == actualSize;
+    }
+
+    private static boolean matchesIgnore(Set<String> patterns, String fileName, String modId) {
+        if (patterns == null) return false;
+        for (String pattern : patterns) {
+            if (pattern != null && !pattern.isEmpty()
+                    && ((fileName != null && fileName.contains(pattern)) || (modId != null && modId.contains(pattern)))) return true;
+        }
+        return false;
+    }
+
+    private static String validateExpectedEnvironment(List<LocalModInfo> localFiles,
+                                                      List<ServerSideManager.ModInfo> authority,
+                                                      List<ServerSideManager.ForcedRule> forced) {
+        return validateExpectedEnvironment(localFiles, authority, forced, false);
+    }
+
+    private static String validateExpectedEnvironment(List<LocalModInfo> localFiles,
+                                                      List<ServerSideManager.ModInfo> authority,
+                                                      List<ServerSideManager.ForcedRule> forced,
+                                                      boolean allowConnectionProvenLocalMods) {
+        try {
+            Map<String, LocalModInfo> local = localFiles.stream().collect(Collectors.toMap(
+                    info -> info.fileName, info -> info, (left, right) -> left));
+            Set<String> ignores = new HashSet<>();
+            Set<String> forcedModFiles = new HashSet<>();
+            if (forced != null) {
+                for (ServerSideManager.ForcedRule rule : forced) {
+                    if ("IGNORE".equalsIgnoreCase(rule.action)) ignores.add(rule.target);
+                    if ("ADD".equalsIgnoreCase(rule.action)) {
+                        Path target = IntegrityUtil.safeResolve(FMLPaths.GAMEDIR.get(), rule.target, false);
+                        if (!IntegrityUtil.matches(target, rule.hash, rule.sha256, rule.size)) {
+                            return "强制文件校验失败: " + rule.target;
+                        }
+                        String normalized = rule.target.replace('\\', '/');
+                        if (normalized.startsWith("mods/")) forcedModFiles.add(target.getFileName().toString());
+                    } else if ("DELETE".equalsIgnoreCase(rule.action)) {
+                        Path target = IntegrityUtil.safeResolve(FMLPaths.GAMEDIR.get(), rule.target, false);
+                        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) return "强制删除未生效: " + rule.target;
+                    }
+                }
+            }
+            Set<String> authorityNames = new HashSet<>();
+            if (authority != null) {
+                for (ServerSideManager.ModInfo expected : authority) {
+                    authorityNames.add(expected.fileName);
+                    if (!expected.isServerRequired || matchesIgnore(ignores, expected.fileName, expected.modId)) continue;
+                    LocalModInfo actual = local.get(expected.fileName);
+                    if (actual == null || !sameFile(expected.hash, expected.sha256, expected.size,
+                            actual.hash, actual.sha256, actual.size)) return "模组哈希不一致: " + expected.fileName;
+                }
+            }
+            if (allowConnectionProvenLocalMods) return null;
+
+            ClientSnapshot baseline = loadSnapshotForServer(CACHED_SYNC_URL.get());
+            Map<String, LocalModInfo> baselineFiles = new HashMap<>();
+            if (baseline != null) for (LocalModInfo info : baseline.files) baselineFiles.put(info.fileName, info);
+            for (LocalModInfo actual : localFiles) {
+                if (authorityNames.contains(actual.fileName) || forcedModFiles.contains(actual.fileName)
+                        || ModSyncMain.MODID.equals(actual.modId)
+                        || matchesIgnore(ignores, actual.fileName, actual.modId)) continue;
+                LocalModInfo old = baselineFiles.get(actual.fileName);
+                if (old == null && baselineFiles.isEmpty() && actual.isClientOnly) continue;
+                if (old == null) return "存在未授权模组: " + actual.fileName;
+                if (!sameFile(old.hash, old.sha256, old.size, actual.hash, actual.sha256, actual.size)) {
+                    return "基准模组被修改: " + actual.fileName;
+                }
+            }
+            for (LocalModInfo old : baselineFiles.values()) {
+                if (ModSyncMain.MODID.equals(old.modId) || authorityNames.contains(old.fileName) || !old.isClientOnly) continue;
+                LocalModInfo actual = local.get(old.fileName);
+                if (actual == null || !sameFile(old.hash, old.sha256, old.size, actual.hash, actual.sha256, actual.size)) {
+                    return "客户端模组偏离基准: " + old.fileName;
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            return "环境验证异常: " + Objects.toString(e.getMessage(), e.getClass().getSimpleName());
+        }
+    }
+
+    private static void mergeOfficialSources(List<LocalModInfo> localFiles, List<ServerSideManager.ModInfo> authority) {
+        if (authority == null) return;
+        Map<String, ServerSideManager.ModInfo> byName = authority.stream().collect(Collectors.toMap(
+                info -> info.fileName, info -> info, (left, right) -> left));
+        for (LocalModInfo local : localFiles) {
+            ServerSideManager.ModInfo remote = byName.get(local.fileName);
+            if (remote != null && sameFile(remote.hash, remote.sha256, remote.size, local.hash, local.sha256, local.size)) {
+                local.officialUrls = remote.officialUrls == null ? new ArrayList<>() : new ArrayList<>(remote.officialUrls);
+            }
+        }
+    }
+
+    private static void backupVerifiedMods(List<LocalModInfo> files) {
+        for (LocalModInfo mod : files) {
+            if (ModSyncMain.MODID.equals(mod.modId)) continue;
+            Path path = FMLPaths.MODSDIR.get().resolve(mod.fileName);
+            if (IntegrityUtil.matches(path, mod.hash, mod.sha256, mod.size)) {
+                WarehouseManager.backupToWarehouse(path, mod.hash, mod.sha256, mod.size);
+            }
+        }
+    }
+
+    private static String normalizeBaseUrl(String raw) throws IOException {
+        if (raw == null || raw.isBlank() || raw.length() > 2048) throw new IOException("同步地址为空或过长");
+        String value = raw.trim();
+        if (!value.startsWith("http://") && !value.startsWith("https://")) value = "http://" + value;
+        try {
+            URI uri = URI.create(value);
+            if (uri.getHost() == null || uri.getUserInfo() != null || uri.getFragment() != null
+                    || !("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme()))) {
+                throw new IOException("同步地址格式无效");
+            }
+            String normalized = uri.normalize().toString();
+            return normalized.endsWith("/") ? normalized : normalized + "/";
+        } catch (IllegalArgumentException e) {
+            throw new IOException("同步地址格式无效", e);
+        }
+    }
+
+    private static boolean sameServerUrl(String left, String right) {
+        try { return normalizeBaseUrl(left).equalsIgnoreCase(normalizeBaseUrl(right)); }
+        catch (IOException e) { return false; }
+    }
+
+    private static void moveAtomically(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
 
     // ================== UI Classes ==================
 
@@ -609,14 +1078,15 @@ public class ClientSideManager {
     }
 
     public static class SyncResultScreen extends Screen {
-        private final Screen parent; private final List<String> toDownload; private final List<ModActionItem> actionItems;
+        private final Screen parent; private final List<ModActionItem> actionItems;
         private final String baseUrl; private final String s1, sF, s2, s3;
-        private ModListWidget modList; private Button execBtn; private boolean isExecuting = false; private boolean isFinished = false;
+        private ModListWidget modList; private SyncProgressButton execBtn; private Button cancelBtn;
+        private boolean isExecuting = false; private boolean isFinished = false;
         private final PatchPacket packet;
         private final boolean showWarning;
 
         public SyncResultScreen(Screen p, PatchPacket pkt, List<ModActionItem> items, String url, String s1, String sF, String s2, String s3, boolean showWarning) {
-            super(Component.literal("Results")); this.parent = p; this.packet = pkt; this.toDownload = new ArrayList<>(); this.actionItems = items; this.baseUrl = url;
+            super(Component.literal("Results")); this.parent = p; this.packet = pkt; this.actionItems = items; this.baseUrl = url;
             this.s1 = s1; this.sF = sF; this.s2 = s2; this.s3 = s3; this.showWarning = showWarning;
         }
         @Override protected void init() {
@@ -629,11 +1099,16 @@ public class ClientSideManager {
                 modList.add(new ActionEntry(item));
             }
             this.addRenderableWidget(modList);
-            if (!isFinished) { execBtn = Button.builder(Component.literal("执行同步"), b -> startExecution()).bounds(cx - 105, this.height - 30, 210, 20).build(); }
-            else { execBtn = Button.builder(Component.literal("同步完成 - 点击退出游戏"), b -> System.exit(0)).bounds(cx - 105, this.height - 30, 210, 20).build(); }
+            if (!isFinished) execBtn = new SyncProgressButton(cx - 150, this.height - 30, 300, 20,
+                    Component.literal("执行同步"), this::startExecution);
+            else execBtn = new SyncProgressButton(cx - 150, this.height - 30, 300, 20,
+                    Component.literal("同步完成 - 点击安全退出游戏"), () -> Minecraft.getInstance().stop());
+            if (isFinished) execBtn.setProgress(1.0, "同步完成 - 点击安全退出游戏");
             if (isExecuting) execBtn.active = false;
             this.addRenderableWidget(execBtn);
-            this.addRenderableWidget(Button.builder(Component.literal("取消"), b -> this.minecraft.setScreen(parent)).bounds(cx - 50, this.height - 55, 100, 20).build());
+            cancelBtn = Button.builder(Component.literal("取消"), b -> this.minecraft.setScreen(parent)).bounds(cx - 50, this.height - 55, 100, 20).build();
+            cancelBtn.active = !isExecuting && !isFinished;
+            this.addRenderableWidget(cancelBtn);
         }
         @Override public void render(GuiGraphics g, int mx, int my, float pt) {
             this.renderBackground(g); if (modList != null) modList.render(g, mx, my, pt); super.render(g, mx, my, pt);
@@ -653,103 +1128,232 @@ public class ClientSideManager {
                 g.drawString(font, "§e建议查看有无更新整合包", 5, this.height - 15, 0xFFFFFF);
             }
         }
+        @Override public boolean shouldCloseOnEsc() { return !isExecuting; }
+
         private void startExecution() {
-            isExecuting = true; execBtn.active = false; execBtn.setMessage(Component.literal("正在处理..."));
+            if (isExecuting) return;
+            if (actionItems.stream().anyMatch(item -> !item.selected)) {
+                execBtn.setMessage(Component.literal("严格同步要求勾选全部项目"));
+                return;
+            }
+            isExecuting = true;
+            execBtn.active = false;
+            cancelBtn.active = false;
+            execBtn.setProgress(0.0, "准备同步事务...");
             CompletableFuture.runAsync(() -> {
-                StringBuilder errorLog = new StringBuilder();
+                Path stagingRoot = null;
+                Path transactionBackup = null;
+                Map<Path, Path> backups = new LinkedHashMap<>();
+                List<Path> createdTargets = new ArrayList<>();
                 try {
                     WarehouseManager.init(WAREHOUSE_ROOT_DIR);
-                    if (!Files.exists(BACKUP_DIR)) Files.createDirectories(BACKUP_DIR);
-                    for (ModActionItem item : actionItems) {
-                        if (item.selected && (item.type.equals("SERVER_REMOVED") || item.type.equals("ILLEGAL") || item.type.equals("UPDATE") || item.type.equals("FORCED_DELETE"))) {
-                            if (item.path != null && Files.exists(item.path)) {
-                                if (Files.isDirectory(item.path)) {
-                                    deleteDirectoryRecursively(item.path);
-                                } else {
-                                    try { Files.move(item.path, BACKUP_DIR.resolve(item.path.getFileName()), StandardCopyOption.REPLACE_EXISTING); }
-                                    catch (IOException e) { item.path.toFile().renameTo(new File(item.path.toFile().getAbsolutePath() + ".old")); }
-                                }
-                            }
-                        }
+                    validatePatchPacket(packet);
+                    List<ModActionItem> tasks = flattenTasks();
+                    if (tasks.isEmpty()) throw new IOException("同步计划为空");
+                    Set<Path> plannedTargets = new HashSet<>();
+                    for (ModActionItem task : tasks) {
+                        Path target = resolveTaskTarget(task);
+                        if (!plannedTargets.add(target)) throw new IOException("同步计划重复操作同一路径: " + task.name);
+                    }
+                    Files.createDirectories(BACKUP_DIR);
+                    String transactionId = Long.toUnsignedString(System.currentTimeMillis()) + "-" + UUID.randomUUID();
+                    stagingRoot = IntegrityUtil.safeResolve(WAREHOUSE_ROOT_DIR, "staging/" + transactionId, false);
+                    transactionBackup = IntegrityUtil.safeResolve(BACKUP_DIR, "transactions/" + transactionId, false);
+                    Files.createDirectories(stagingRoot);
+                    Files.createDirectories(transactionBackup);
+                    String effectiveBaseUrl = normalizeBaseUrl(baseUrl);
+
+                    Map<ModActionItem, Path> staged = new IdentityHashMap<>();
+                    int acquisitionCount = (int) tasks.stream().filter(this::needsAcquisition).count();
+                    int totalSteps = Math.max(1, acquisitionCount + tasks.size() + 1);
+                    int completedSteps = 0;
+                    int stageIndex = 0;
+                    for (ModActionItem task : tasks) {
+                        if (!needsAcquisition(task)) continue;
+                        Path stagedFile = IntegrityUtil.safeResolve(stagingRoot, String.format(Locale.ROOT, "%05d.bin", stageIndex++), false);
+                        final int baseStep = completedSteps;
+                        stageTask(task, stagedFile, effectiveBaseUrl, (source, bytes, total) -> {
+                            double filePart = total > 0 ? Math.min(1.0, (double) bytes / total) : 0.25;
+                            execBtn.setProgress((baseStep + filePart) / totalSteps,
+                                    source + " · " + task.name + (total > 0 ? " · " + (bytes * 100 / total) + "%" : ""));
+                        });
+                        staged.put(task, stagedFile);
+                        completedSteps++;
+                        execBtn.setProgress((double) completedSteps / totalSteps, "已校验 · " + task.name);
                     }
 
-                    // 🟢 补上漏掉的变量定义
-                    Path localModsDir = FMLPaths.MODSDIR.get();
-
-                    String effectiveBaseUrl = baseUrl;
-                    if (effectiveBaseUrl.contains(":") && !effectiveBaseUrl.contains("[")) {
-                        if (effectiveBaseUrl.chars().filter(ch -> ch == ':').count() > 1) {
-                            if (effectiveBaseUrl.startsWith("http://")) effectiveBaseUrl = "http://[" + effectiveBaseUrl.substring(7) + "]";
-                            else effectiveBaseUrl = "http://[" + effectiveBaseUrl + "]";
-                        }
+                    int applyIndex = 0;
+                    for (ModActionItem task : tasks) {
+                        execBtn.setProgress((double) completedSteps / totalSteps,
+                                "正在应用 " + (++applyIndex) + "/" + tasks.size() + " · " + task.name);
+                        applyTask(task, staged.get(task), transactionBackup, backups, createdTargets);
+                        completedSteps++;
                     }
-                    if (!effectiveBaseUrl.startsWith("http")) effectiveBaseUrl = "http://" + effectiveBaseUrl;
-                    if (!effectiveBaseUrl.endsWith("/")) effectiveBaseUrl += "/";
 
-
-                    for (ModActionItem item : actionItems) {
-                        if (!item.selected) continue;
-
-                        List<ModActionItem> tasks = new ArrayList<>();
-                        if (item.subItems != null) tasks.addAll(item.subItems);
-                        else tasks.add(item);
-
-                        for (ModActionItem task : tasks) {
-                            if (task.type.equals("FORCED_OVERWRITE")) {
-                                try {
-                                    Path target = task.path;
-                                    if (target.getParent() != null && !Files.exists(target.getParent())) Files.createDirectories(target.getParent());
-                                    String encoded = URLEncoder.encode(task.extraInfo, StandardCharsets.UTF_8.toString()).replace("+", "%20");
-                                    downloadFile(new URL(effectiveBaseUrl + "forced/" + encoded), target);
-                                } catch (Exception e) {
-                                    errorLog.append("强制文件下载失败: ").append(task.name).append(" (").append(e.getClass().getSimpleName()).append(")\n");
-                                }
-                            } else if (task.type.equals("RESTORE") || task.type.equals("NEW") || task.type.equals("UPDATE")) {
-                                boolean restored = false;
-                                if (task.type.equals("RESTORE") || task.type.equals("NEW")) { restored = WarehouseManager.restoreFromWarehouse(task.name, localModsDir); }
-                                if (!restored) {
-                                    try {
-                                        String encoded = URLEncoder.encode(task.name, StandardCharsets.UTF_8.toString()).replace("+", "%20");
-                                        downloadFile(new URL(effectiveBaseUrl + "download/" + encoded), localModsDir.resolve(task.name));
-                                        WarehouseManager.backupToWarehouse(localModsDir.resolve(task.name));
-                                    } catch (Exception e) {
-                                        errorLog.append("下载失败: ").append(task.name).append(" (").append(e.getClass().getSimpleName()).append(")\n");
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    List<LocalModInfo> currentFiles = scanLocalMods();
+                    String validationError = validateExpectedEnvironment(currentFiles,
+                            packet.authorityManifest, packet.forcedActions,
+                            isConnectionProofFor(effectiveBaseUrl, packet.targetVersion));
+                    if (validationError != null) throw new IOException(validationError);
+                    mergeOfficialSources(currentFiles, packet.authorityManifest);
+                    backupVerifiedMods(currentFiles);
+                    if (stagingRoot != null) deleteTree(stagingRoot);
+                    stagingRoot = null;
+                    savePendingSync(packet, effectiveBaseUrl);
+                    execBtn.setProgress(1.0, "同步与哈希复核完成");
                     Minecraft.getInstance().execute(() -> {
                         isExecuting = false;
-                        if (errorLog.length() > 0) { execBtn.active = true; execBtn.setMessage(Component.literal("部分失败 (见日志)")); System.out.println(errorLog); }
-                        else { isFinished = true; this.clearWidgets(); this.init(); }
+                        isFinished = true;
+                        this.clearWidgets();
+                        this.init();
                     });
-                } catch (Exception e) { e.printStackTrace(); }
+                } catch (Exception e) {
+                    LOGGER.error("AutoModSync: Sync transaction failed; rolling back", e);
+                    rollback(createdTargets, backups);
+                    if (stagingRoot != null) {
+                        try { deleteTree(stagingRoot); } catch (IOException ignored) {}
+                    }
+                    String reason = Objects.toString(e.getMessage(), e.getClass().getSimpleName());
+                    if (reason.length() > 80) reason = reason.substring(0, 80);
+                    String finalReason = reason;
+                    Minecraft.getInstance().execute(() -> {
+                        isExecuting = false;
+                        execBtn.active = true;
+                        cancelBtn.active = true;
+                        execBtn.setProgress(0.0, "失败并已回滚 · " + finalReason);
+                    });
+                }
             });
         }
 
-        private void deleteDirectoryRecursively(Path dir) {
-            try {
-                Files.walkFileTree(dir, new SimpleFileVisitor<Path>() {
-                    @Override
-                    public FileVisitResult visitFile(Path file, java.nio.file.attribute.BasicFileAttributes attrs) throws IOException {
-                        Files.delete(file);
-                        return FileVisitResult.CONTINUE;
+        private List<ModActionItem> flattenTasks() {
+            List<ModActionItem> tasks = new ArrayList<>();
+            for (ModActionItem item : actionItems) {
+                if (!item.selected) continue;
+                if (item.subItems == null) tasks.add(item);
+                else tasks.addAll(item.subItems);
+            }
+            return tasks;
+        }
+
+        private boolean needsAcquisition(ModActionItem task) {
+            return task.type.equals("FORCED_OVERWRITE") || task.type.equals("RESTORE")
+                    || task.type.equals("NEW") || task.type.equals("UPDATE");
+        }
+
+        private void stageTask(ModActionItem task, Path stagedFile, String effectiveBaseUrl,
+                               SecureDownloader.ProgressListener progress) throws IOException {
+            ServerSideManager.ModInfo info = task.modInfo;
+            if (info == null && packet.authorityManifest != null) {
+                info = packet.authorityManifest.stream().filter(candidate -> task.name.equals(candidate.fileName)).findFirst().orElse(null);
+            }
+            if (info != null) task.expect(info.hash, info.sha256, info.size);
+
+            if (task.type.equals("RESTORE")) {
+                Path stored = WarehouseManager.getFileInWarehouse(task.name,
+                        task.expectedSha1, task.expectedSha256, task.expectedSize);
+                if (stored != null) {
+                    Files.copy(stored, stagedFile, StandardCopyOption.REPLACE_EXISTING);
+                    if (!IntegrityUtil.matches(stagedFile, task.expectedSha1, task.expectedSha256, task.expectedSize)) {
+                        Files.deleteIfExists(stagedFile);
+                        throw new IOException("本地仓库文件校验失败: " + task.name);
                     }
-                    @Override
-                    public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                        Files.delete(dir);
-                        return FileVisitResult.CONTINUE;
-                    }
-                });
-            } catch (IOException e) { e.printStackTrace(); }
+                    progress.update("本地仓库", task.expectedSize, task.expectedSize);
+                    return;
+                }
+            }
+
+            if (task.type.equals("FORCED_OVERWRITE")) {
+                if (task.forcedRule == null || task.forcedRule.source == null) throw new IOException("强制规则缺少来源: " + task.name);
+                String encoded = URLEncoder.encode(task.forcedRule.source, StandardCharsets.UTF_8).replace("+", "%20");
+                SecureDownloader.download(Collections.emptyList(), new URL(effectiveBaseUrl + "forced/" + encoded), stagedFile,
+                        task.forcedRule.hash, task.forcedRule.sha256, task.forcedRule.size, progress);
+                return;
+            }
+
+            if (info == null) throw new IOException("没有可恢复的仓库文件或权威下载记录: " + task.name);
+            String encoded = URLEncoder.encode(info.fileName, StandardCharsets.UTF_8).replace("+", "%20");
+            SecureDownloader.download(info.officialUrls, new URL(effectiveBaseUrl + "download/" + encoded), stagedFile,
+                    info.hash, info.sha256, info.size, progress);
+        }
+
+        private void applyTask(ModActionItem task, Path staged, Path transactionBackup,
+                               Map<Path, Path> backups, List<Path> createdTargets) throws IOException {
+            Path gameDir = FMLPaths.GAMEDIR.get().toAbsolutePath().normalize();
+            Path target = resolveTaskTarget(task);
+            if (!target.startsWith(gameDir) || target.equals(gameDir)) throw new IOException("目标越界: " + task.name);
+
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)
+                        && task.type.equals("FORCED_DELETE") && !packet.allowFolderDelete) {
+                    throw new IOException("目录删除未获授权: " + task.name);
+                }
+                Path relative = gameDir.relativize(target);
+                Path backup = IntegrityUtil.safeResolve(transactionBackup, relative.toString(), false);
+                Files.createDirectories(backup.getParent());
+                moveAtomically(target, backup);
+                backups.put(target, backup);
+            }
+
+            if (needsAcquisition(task)) {
+                if (staged == null || !IntegrityUtil.matches(staged,
+                        task.expectedSha1, task.expectedSha256, task.expectedSize)) {
+                    throw new IOException("暂存文件复核失败: " + task.name);
+                }
+                Files.createDirectories(target.getParent());
+                moveAtomically(staged, target);
+                createdTargets.add(target);
+            }
+        }
+
+        private Path resolveTaskTarget(ModActionItem task) throws IOException {
+            if (task.type.equals("NEW") || task.type.equals("UPDATE") || task.type.equals("RESTORE")
+                    || task.type.equals("SERVER_REMOVED") || task.type.equals("LOCAL_UNVERIFIED")) {
+                return IntegrityUtil.safeResolve(FMLPaths.MODSDIR.get(), task.name, false).toAbsolutePath().normalize();
+            }
+            if (task.forcedRule == null || task.forcedRule.target == null) throw new IOException("强制操作缺少目标: " + task.name);
+            return IntegrityUtil.safeResolve(FMLPaths.GAMEDIR.get(), task.forcedRule.target, false).toAbsolutePath().normalize();
+        }
+
+        private void rollback(List<Path> createdTargets, Map<Path, Path> backups) {
+            ListIterator<Path> created = createdTargets.listIterator(createdTargets.size());
+            while (created.hasPrevious()) {
+                try { deleteTree(created.previous()); } catch (IOException e) { LOGGER.error("Rollback delete failed", e); }
+            }
+            List<Map.Entry<Path, Path>> entries = new ArrayList<>(backups.entrySet());
+            Collections.reverse(entries);
+            for (Map.Entry<Path, Path> entry : entries) {
+                try {
+                    Files.createDirectories(entry.getKey().getParent());
+                    moveAtomically(entry.getValue(), entry.getKey());
+                } catch (IOException e) {
+                    LOGGER.error("Rollback restore failed: {}", entry.getKey(), e);
+                }
+            }
+        }
+
+        private void deleteTree(Path path) throws IOException {
+            if (path == null || !Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return;
+            if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+                Files.deleteIfExists(path);
+                return;
+            }
+            Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+                @Override public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    Files.delete(file); return FileVisitResult.CONTINUE;
+                }
+                @Override public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                    if (exc != null) throw exc;
+                    Files.delete(dir); return FileVisitResult.CONTINUE;
+                }
+            });
         }
 
         private int getTypePriority(ModActionItem item) {
             switch (item.type) {
                 case "FORCED_DELETE": return 0; case "FORCED_OVERWRITE": return 0;
                 case "RESTORE": return 1; case "NEW": return 2; case "UPDATE": return 2;
-                case "SERVER_REMOVED": return 3; case "ILLEGAL": return 4; default: return 5;
+                case "SERVER_REMOVED": return 3; case "LOCAL_UNVERIFIED": return 4; default: return 5;
             }
         }
         private String getCategoryTitle(String type) {
@@ -757,11 +1361,50 @@ public class ClientSideManager {
                 case "FORCED_DELETE": return "§c[强制删除] (策略要求)";
                 case "FORCED_OVERWRITE": return "§e[强制覆盖] (策略要求)";
                 case "RESTORE": return "§b[本地自愈] (误删恢复)"; case "NEW": return "§a[新增模组] (下载)";
-                case "UPDATE": return "§6[版本更新] (替换)"; case "SERVER_REMOVED": return "§c[服务端移除] (删除)";
-                case "ILLEGAL": return "§4[仓库清理] (未授权/残留)"; default: return "§7[其他]";
+                case "UPDATE": return "§6[版本更新] (替换)"; case "SERVER_REMOVED": return "§c[服务移除] (删除)";
+                case "LOCAL_UNVERIFIED": return "§4[本地待验] (未通过进服验证)"; default: return "§7[其他]";
             }
         }
     }
+
+    /** Button that turns into an in-place progress bar and embeds the current filename. */
+    public static class SyncProgressButton extends AbstractButton {
+        private final Runnable onPress;
+        private volatile double progress;
+        private volatile String progressText;
+
+        public SyncProgressButton(int x, int y, int width, int height, Component message, Runnable onPress) {
+            super(x, y, width, height, message);
+            this.onPress = onPress;
+            this.progressText = message.getString();
+        }
+
+        public void setProgress(double progress, String text) {
+            this.progress = Math.max(0.0, Math.min(1.0, progress));
+            this.progressText = text == null ? "" : text;
+        }
+
+        @Override public void onPress() { if (active) onPress.run(); }
+
+        @Override protected void renderWidget(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
+            int x = getX();
+            int y = getY();
+            int border = active && isHoveredOrFocused() ? 0xFFFFFFFF : 0xFF9A9A9A;
+            int background = active ? 0xFF202020 : 0xFF303030;
+            graphics.fill(x, y, x + width, y + height, border);
+            graphics.fill(x + 1, y + 1, x + width - 1, y + height - 1, background);
+            int fillWidth = (int) Math.round((width - 2) * progress);
+            if (fillWidth > 0) graphics.fill(x + 1, y + 1, x + 1 + fillWidth, y + height - 1, 0xFF238636);
+            String label = progressText == null || progressText.isBlank() ? getMessage().getString() : progressText;
+            label = Minecraft.getInstance().font.plainSubstrByWidth(label, width - 12);
+            graphics.drawCenteredString(Minecraft.getInstance().font, label, x + width / 2, y + (height - 8) / 2, 0xFFFFFF);
+        }
+
+        @Override protected void updateWidgetNarration(NarrationElementOutput output) {
+            defaultButtonNarrationText(output);
+        }
+    }
+
     public static class ModListWidget extends ObjectSelectionList<ModListWidget.BaseEntry> {
         public ModListWidget(Minecraft mc, int w, int h, int t, int b, int ih) { super(mc, w, h, t, b, ih); }
         @Override public int getRowWidth() { return 300; }
@@ -775,13 +1418,20 @@ public class ClientSideManager {
     }
     public static class ActionEntry extends ModListWidget.BaseEntry {
         private final ModActionItem item; public ActionEntry(ModActionItem item) { this.item = item; }
+        private int rowLeft, rowTop, rowWidth, rowHeight;
         @Override public void render(GuiGraphics g, int idx, int t, int l, int w, int h, int mx, int my, boolean hov, float pt) {
+            rowLeft = l; rowTop = t; rowWidth = w; rowHeight = h;
             g.fill(l + 5, t + 2, l + 25, t + 22, 0xFF888888); g.fill(l + 6, t + 3, l + 24, t + 21, 0xFF000000);
             if (item.selected) { g.pose().pushPose(); g.pose().translate(l + 15, t + 7, 0); g.drawCenteredString(Minecraft.getInstance().font, "§aV", 0, 0, 0xFFFFFF); g.pose().popPose(); }
             g.drawString(Minecraft.getInstance().font, item.name, l + 30, t + 8, 0xFFFFFF);
         }
         @Override public boolean mouseClicked(double mx, double my, int btn) {
-            if (btn == 0 && mx < 280) { item.selected = !item.selected; Minecraft.getInstance().getSoundManager().play(net.minecraft.client.resources.sounds.SimpleSoundInstance.forUI(net.minecraft.sounds.SoundEvents.UI_BUTTON_CLICK, 1.0F)); return true; } return false;
+            if (btn == 0 && mx >= rowLeft && mx <= rowLeft + rowWidth && my >= rowTop && my <= rowTop + rowHeight) {
+                item.selected = !item.selected;
+                Minecraft.getInstance().getSoundManager().play(net.minecraft.client.resources.sounds.SimpleSoundInstance.forUI(net.minecraft.sounds.SoundEvents.UI_BUTTON_CLICK, 1.0F));
+                return true;
+            }
+            return false;
         }
     }
 }

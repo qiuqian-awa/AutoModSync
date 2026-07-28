@@ -19,7 +19,6 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
@@ -33,11 +32,19 @@ public class ServerSideManager {
     private static final Path CHANGELOG_FILE = STORAGE_DIR.resolve("changelog.json");
     private static HttpServer serverInstance;
     private static int currentLatestVersion = 0;
+    private static OfficialSourceResolver sourceResolver;
 
     public static class Changelog { public int latestVersion = 0; public long lastUpdated; }
     public static class FullManifest { public int version; public List<ModInfo> files = new ArrayList<>(); public List<ForcedRule> forcedFiles = new ArrayList<>(); }
     public static class ModInfo {
-        public String fileName; public String modId; public String hash; public boolean isServerRequired;
+        public String fileName;
+        public String modId;
+        /** Legacy SHA-1 field kept for old manifests and clients. */
+        public String hash;
+        public String sha256;
+        public long size = -1L;
+        public List<String> officialUrls = new ArrayList<>();
+        public boolean isServerRequired;
         @Override public boolean equals(Object o) { if (this == o) return true; if (o == null || getClass() != o.getClass()) return false; ModInfo modInfo = (ModInfo) o; return Objects.equals(modId, modInfo.modId); }
         @Override public int hashCode() { return Objects.hash(modId); }
     }
@@ -49,7 +56,16 @@ public class ServerSideManager {
         public List<ForcedRule> forcedActions = new ArrayList<>();
         public List<ModInfo> authorityManifest = new ArrayList<>();
     }
-    public static class ForcedRule { public String action; public String source; public String target; public String hash; public ForcedRule(String a, String s, String t, String h) { action=a; source=s; target=t; hash=h; } }
+    public static class ForcedRule {
+        public String action;
+        public String source;
+        public String target;
+        /** Legacy SHA-1 field. */
+        public String hash;
+        public String sha256;
+        public long size = -1L;
+        public ForcedRule(String a, String s, String t, String h) { action=a; source=s; target=t; hash=h; }
+    }
 
     public static int getCurrentVersion() { return currentLatestVersion; }
 
@@ -57,9 +73,9 @@ public class ServerSideManager {
         LOGGER.info("AutoModSync: Initializing HTTP Server Logic (Lazy Start)...");
         Thread serverThread = new Thread(() -> {
             try {
-                Thread.sleep(10000);
                 if (!Files.exists(STORAGE_DIR)) Files.createDirectories(STORAGE_DIR);
                 WarehouseManager.init(STORAGE_DIR);
+                sourceResolver = new OfficialSourceResolver(STORAGE_DIR);
                 ForcedSyncInternal.init();
                 performVersionControl();
 
@@ -76,6 +92,7 @@ public class ServerSideManager {
                             if (v.contains("&")) v = v.substring(0, v.indexOf("&"));
                             try { clientVer = Integer.parseInt(v); } catch (NumberFormatException ignored) {}
                         }
+                        if (clientVer < 0 || clientVer > currentLatestVersion) clientVer = 0;
                         PatchPacket packet = calculatePatch(clientVer);
                         String json = GSON.toJson(packet);
                         byte[] response = json.getBytes(StandardCharsets.UTF_8);
@@ -91,16 +108,22 @@ public class ServerSideManager {
                         if (idx == -1) { exchange.sendResponseHeaders(404, -1); return; }
 
                         String pathPart = rawUri.substring(idx + 10);
-                        String filename = URLDecoder.decode(pathPart, StandardCharsets.UTF_8.toString());
-
-                        if (filename.contains("..")) { exchange.sendResponseHeaders(403, -1); return; }
+                        String filename = IntegrityUtil.normalizeFileName(URLDecoder.decode(pathPart, StandardCharsets.UTF_8));
 
                         LOGGER.debug("AutoModSync Download: Req=" + rawUri + " -> File=" + filename);
 
-                        Path filePath = FMLPaths.MODSDIR.get().resolve(filename);
-                        if (!Files.exists(filePath)) filePath = WarehouseManager.getFileInWarehouse(filename);
+                        FullManifest active = loadManifest(currentLatestVersion);
+                        ModInfo expected = active == null ? null : active.files.stream()
+                                .filter(m -> filename.equals(m.fileName) && m.isServerRequired).findFirst().orElse(null);
+                        if (expected == null) { exchange.sendResponseHeaders(404, -1); return; }
+                        Path filePath = IntegrityUtil.safeResolve(FMLPaths.MODSDIR.get(), filename, false);
+                        if (!IntegrityUtil.matches(filePath, expected.hash, expected.sha256, expected.size)) {
+                            filePath = WarehouseManager.getFileInWarehouse(filename, expected.hash, expected.sha256, expected.size);
+                        }
 
-                        if (filePath != null && Files.exists(filePath)) {
+                        if (filePath != null && IntegrityUtil.matches(filePath, expected.hash, expected.sha256, expected.size)) {
+                            exchange.getResponseHeaders().set("Content-Type", "application/java-archive");
+                            exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
                             exchange.sendResponseHeaders(200, Files.size(filePath));
                             try (OutputStream os = exchange.getResponseBody()) { Files.copy(filePath, os); }
                         } else {
@@ -121,9 +144,13 @@ public class ServerSideManager {
 
                         String pathPart = rawUri.substring(idx + 8);
                         String relativePath = URLDecoder.decode(pathPart, StandardCharsets.UTF_8.toString());
-
+                        FullManifest active = loadManifest(currentLatestVersion);
+                        ForcedRule expected = active == null || active.forcedFiles == null ? null : active.forcedFiles.stream()
+                                .filter(r -> "ADD".equals(r.action) && relativePath.equals(r.source)).findFirst().orElse(null);
+                        if (expected == null) { exchange.sendResponseHeaders(404, -1); return; }
                         Path filePath = ForcedSyncInternal.getFile(relativePath);
-                        if (filePath != null && Files.isRegularFile(filePath)) {
+                        if (filePath != null && IntegrityUtil.matches(filePath, expected.hash, expected.sha256, expected.size)) {
+                            exchange.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
                             exchange.sendResponseHeaders(200, Files.size(filePath));
                             try (OutputStream os = exchange.getResponseBody()) { Files.copy(filePath, os); }
                         } else { exchange.sendResponseHeaders(404, -1); }
@@ -171,7 +198,7 @@ public class ServerSideManager {
             for (ModInfo info : currentManifest.files) {
                 if (info.isServerRequired) {
                     Path p = FMLPaths.MODSDIR.get().resolve(info.fileName);
-                    WarehouseManager.backupToWarehouse(p);
+                    WarehouseManager.backupToWarehouse(p, info.hash, info.sha256, info.size);
                 }
             }
             log.latestVersion = currentLatestVersion;
@@ -208,7 +235,12 @@ public class ServerSideManager {
 
             ModInfo clientMod = clientMap.get(serverMod.modId);
             if (clientMod == null) { packet.toDownload.add(serverMod); }
-            else { if (!clientMod.hash.equals(serverMod.hash) || !clientMod.fileName.equals(serverMod.fileName)) packet.toDownload.add(serverMod); }
+            else if (!Objects.equals(clientMod.hash, serverMod.hash)
+                    || !Objects.equals(clientMod.sha256, serverMod.sha256)
+                    || clientMod.size != serverMod.size
+                    || !Objects.equals(clientMod.fileName, serverMod.fileName)) {
+                packet.toDownload.add(serverMod);
+            }
         }
         Set<String> serverModIds = latest.files.stream().map(m -> m.modId).collect(Collectors.toSet());
         for (ModInfo old : clientFiles) {
@@ -226,9 +258,17 @@ public class ServerSideManager {
 
     private static boolean isDifferent(List<ModInfo> current, List<ModInfo> last) {
         if (current.size() != last.size()) return true;
-        Set<String> currentHashes = current.stream().filter(m->m.isServerRequired).map(m -> m.modId + m.hash).collect(Collectors.toSet());
-        Set<String> lastHashes = last.stream().filter(m->m.isServerRequired).map(m -> m.modId + m.hash).collect(Collectors.toSet());
-        return !currentHashes.equals(lastHashes);
+        Set<String> currentState = current.stream().map(ServerSideManager::manifestIdentity).collect(Collectors.toSet());
+        Set<String> lastState = last.stream().map(ServerSideManager::manifestIdentity).collect(Collectors.toSet());
+        return !currentState.equals(lastState);
+    }
+
+    private static String manifestIdentity(ModInfo mod) {
+        List<String> urls = mod.officialUrls == null ? new ArrayList<>() : new ArrayList<>(mod.officialUrls);
+        Collections.sort(urls);
+        return String.join("\u0000", Objects.toString(mod.modId, ""), Objects.toString(mod.fileName, ""),
+                Objects.toString(mod.hash, ""), Objects.toString(mod.sha256, ""), Long.toString(mod.size),
+                Boolean.toString(mod.isServerRequired), String.join("\u0001", urls));
     }
 
     private static FullManifest loadManifest(int ver) {
@@ -251,6 +291,7 @@ public class ServerSideManager {
         }
 
         List<ModInfo> list = new ArrayList<>();
+        Map<String, Path> sourcePaths = new HashMap<>();
         // 🟢 初始化绝对路径并标准化
         Path modsDirAbs = FMLPaths.MODSDIR.get().toAbsolutePath().normalize();
 
@@ -293,10 +334,26 @@ public class ServerSideManager {
             info.fileName = fileName;
             boolean isClientOnly = isClientOnlyMod(mod, modPath);
             info.isServerRequired = !isClientOnly;
-            info.hash = calculateHash(modPath.toFile());
-
-            if (list.stream().noneMatch(m -> m.fileName.equals(info.fileName))) list.add(info);
+            try {
+                IntegrityUtil.Hashes hashes = IntegrityUtil.hash(modPath);
+                info.hash = hashes.sha1();
+                info.sha256 = hashes.sha256();
+                info.size = hashes.size();
+                info.officialUrls = new ArrayList<>();
+            } catch (IOException e) {
+                LOGGER.warn("AutoModSync: Skipped unreadable mod {}", modPath, e);
+                continue;
+            }
+            if (list.stream().noneMatch(m -> m.fileName.equals(info.fileName))) {
+                list.add(info);
+                sourcePaths.put(info.fileName, modPath);
+            }
         }
+        if (sourceResolver != null) {
+            list.parallelStream().forEach(info -> info.officialUrls = sourceResolver.resolve(
+                    sourcePaths.get(info.fileName), info.fileName, info.modId, info.hash));
+        }
+        list.sort(Comparator.comparing(info -> info.fileName));
         return list;
     }
 
@@ -321,15 +378,6 @@ public class ServerSideManager {
             }
         } catch (Exception ignored) {}
         return false;
-    }
-
-    private static String calculateHash(File file) {
-        try (FileInputStream fis = new FileInputStream(file)) {
-            MessageDigest digest = MessageDigest.getInstance("SHA-1");
-            byte[] buffer = new byte[4096]; int n;
-            while ((n = fis.read(buffer)) != -1) digest.update(buffer, 0, n);
-            StringBuilder sb = new StringBuilder(); for (byte b : digest.digest()) sb.append(String.format("%02x", b)); return sb.toString();
-        } catch (Exception e) { return ""; }
     }
 
     private static class ForcedSyncInternal {
@@ -411,7 +459,8 @@ public class ServerSideManager {
         public static List<ForcedRule> generateRules() {
             List<ForcedRule> rules = new ArrayList<>();
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(DIR_MODS_ADD)) {
-                for (Path p : stream) if (Files.isRegularFile(p)) rules.add(new ForcedRule("ADD", "mods_add/" + p.getFileName(), "mods/" + p.getFileName(), calculateHash(p.toFile())));
+                for (Path p : stream) if (Files.isRegularFile(p)) addIfValid(rules,
+                        createAddRule(p, "mods_add/" + p.getFileName(), "mods/" + p.getFileName()));
             } catch (IOException ignored) {}
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(DIR_MODS_REMOVE)) {
                 for (Path p : stream) if (Files.isRegularFile(p)) rules.add(new ForcedRule("DELETE", null, "mods/" + p.getFileName(), null));
@@ -426,7 +475,12 @@ public class ServerSideManager {
                                 continue;
                             }
 
-                            if (entry.path == null || entry.path.contains("..")) continue;
+                            try {
+                                IntegrityUtil.safeResolve(FMLPaths.GAMEDIR.get(), entry.path, false);
+                            } catch (IOException unsafe) {
+                                LOGGER.warn("AutoModSync: Skipped unsafe forced target: {}", entry.path);
+                                continue;
+                            }
 
                             if ("DELETE".equalsIgnoreCase(entry.action)) {
                                 if (entry.isDir) {
@@ -439,12 +493,17 @@ public class ServerSideManager {
                                     rules.add(new ForcedRule("DELETE", null, entry.path, null));
                                 }
                             } else if ("ADD".equalsIgnoreCase(entry.action) && entry.file != null) {
-                                Path src = CUSTOM_FILES_DIR.resolve(entry.file);
+                                Path src;
+                                try { src = IntegrityUtil.safeResolve(CUSTOM_FILES_DIR, entry.file, false); }
+                                catch (IOException unsafe) {
+                                    LOGGER.warn("AutoModSync: Skipped unsafe forced source: {}", entry.file);
+                                    continue;
+                                }
                                 if (Files.exists(src)) {
                                     if (Files.isDirectory(src)) {
                                         addDirectoryRules(rules, src, entry.file, entry.path);
                                     } else {
-                                        rules.add(new ForcedRule("ADD", "custom/files/" + entry.file, entry.path, calculateHash(src.toFile())));
+                                        addIfValid(rules, createAddRule(src, "custom/files/" + entry.file, entry.path));
                                     }
                                 }
                             }
@@ -452,6 +511,10 @@ public class ServerSideManager {
                     }
                 } catch (Exception ignored) {}
             }
+            rules.sort(Comparator.comparing((ForcedRule rule) -> Objects.toString(rule.action, ""))
+                    .thenComparing(rule -> Objects.toString(rule.target, ""))
+                    .thenComparing(rule -> Objects.toString(rule.source, ""))
+                    .thenComparing(rule -> Objects.toString(rule.hash, "")));
             return rules;
         }
 
@@ -463,7 +526,7 @@ public class ServerSideManager {
                         Path relative = rootSrc.relativize(file);
                         String sourcePath = "custom/files/" + rootSrcRel + "/" + relative.toString().replace("\\", "/");
                         String targetPath = rootTargetRel + "/" + relative.toString().replace("\\", "/");
-                        rules.add(new ForcedRule("ADD", sourcePath, targetPath, calculateHash(file.toFile())));
+                        addIfValid(rules, createAddRule(file, sourcePath, targetPath));
                         return FileVisitResult.CONTINUE;
                     }
                 });
@@ -471,9 +534,29 @@ public class ServerSideManager {
         }
 
         public static Path getFile(String relativePath) {
-            if (relativePath.contains("..")) return null;
-            Path p = ROOT_DIR.resolve(relativePath);
-            return Files.isRegularFile(p) ? p : null;
+            try {
+                Path p = IntegrityUtil.safeResolve(ROOT_DIR, relativePath, false);
+                return Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS) ? p : null;
+            } catch (IOException e) {
+                return null;
+            }
+        }
+
+        private static ForcedRule createAddRule(Path file, String source, String target) {
+            try {
+                IntegrityUtil.Hashes hashes = IntegrityUtil.hash(file);
+                ForcedRule rule = new ForcedRule("ADD", source, target, hashes.sha1());
+                rule.sha256 = hashes.sha256();
+                rule.size = hashes.size();
+                return rule;
+            } catch (IOException e) {
+                LOGGER.warn("AutoModSync: Skipped unreadable forced file {}", file, e);
+                return null;
+            }
+        }
+
+        private static void addIfValid(List<ForcedRule> rules, ForcedRule rule) {
+            if (rule != null) rules.add(rule);
         }
     }
 }

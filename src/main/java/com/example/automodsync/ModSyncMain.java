@@ -40,6 +40,8 @@ public class ModSyncMain {
         public final ForgeConfigSpec.IntValue serverPort;
         public final ForgeConfigSpec.ConfigValue<String> syncUrl;
         public final ForgeConfigSpec.BooleanValue allowDirectoryDeletion;
+        public final ForgeConfigSpec.BooleanValue enableOfficialSourceLookup;
+        public final ForgeConfigSpec.ConfigValue<String> curseForgeApiKey;
 
         public CommonConfig(ForgeConfigSpec.Builder builder) {
             builder.push("general");
@@ -47,6 +49,10 @@ public class ModSyncMain {
             syncUrl = builder.comment("Public URL for clients").define("syncUrl", "");
             allowDirectoryDeletion = builder.comment("Allow rules.json to delete directories recursively. DANGEROUS!")
                     .define("allowDirectoryDeletion", false);
+            enableOfficialSourceLookup = builder.comment("Resolve official Modrinth/CurseForge download URLs while creating a manifest")
+                    .define("enableOfficialSourceLookup", true);
+            curseForgeApiKey = builder.comment("Optional CurseForge API key. Leave empty to use Modrinth and manual official_sources.json entries only")
+                    .define("curseForgeApiKey", "");
             builder.pop();
         }
     }
@@ -80,7 +86,25 @@ public class ModSyncMain {
                 CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer), new SyncUrlPacket(url));
             }
             // 🟢 发送服务端版本号
-            CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer), new VersionPacket(ServerSideManager.getCurrentVersion()));
+            int currentVersion = ServerSideManager.getCurrentVersion();
+            if (currentVersion > 0) {
+                CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer), new VersionPacket(currentVersion));
+            } else {
+                Thread retry = new Thread(() -> {
+                    for (int attempt = 0; attempt < 120; attempt++) {
+                        int readyVersion = ServerSideManager.getCurrentVersion();
+                        if (readyVersion > 0) {
+                            if (serverPlayer.getServer() != null) serverPlayer.getServer().execute(() -> {
+                                if (!serverPlayer.isRemoved()) CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer), new VersionPacket(readyVersion));
+                            });
+                            return;
+                        }
+                        try { Thread.sleep(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+                    }
+                }, "AutoModSync-Version-Wait");
+                retry.setDaemon(true);
+                retry.start();
+            }
         }
     }
 

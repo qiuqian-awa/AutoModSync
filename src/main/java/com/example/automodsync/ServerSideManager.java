@@ -9,12 +9,9 @@ import com.google.gson.annotations.SerializedName;
 import com.google.gson.reflect.TypeToken;
 import com.sun.net.httpserver.HttpServer;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraftforge.fml.ModContainer;
-import net.minecraftforge.fml.ModList;
-import net.minecraftforge.fml.IExtensionPoint;
-import net.minecraftforge.network.NetworkConstants;
-import net.minecraftforge.fml.loading.FMLPaths;
-import net.minecraftforge.forgespi.language.IModInfo;
+import net.neoforged.fml.ModList;
+import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.neoforgespi.language.IModInfo;
 import org.slf4j.Logger;
 import com.mojang.logging.LogUtils;
 
@@ -488,7 +485,8 @@ public class ServerSideManager {
         Path modsDirAbs = FMLPaths.MODSDIR.get().toAbsolutePath().normalize();
 
         for (IModInfo mod : ModList.get().getMods()) {
-            if (mod.getModId().equals("minecraft") || mod.getModId().equals("forge")) continue;
+            if (mod.getModId().equals("minecraft") || mod.getModId().equals("forge")
+                    || mod.getModId().equals("neoforge")) continue;
             Path modPath = mod.getOwningFile().getFile().getFilePath();
             if (!Files.isRegularFile(modPath)) continue;
 
@@ -702,7 +700,8 @@ public class ServerSideManager {
                     ModInfo info = entry.getValue();
                     if (info == null) continue;
                     info.modIds = sanitizeModIds(info.modIds);
-                    if (info.modId == null || info.modId.equals("minecraft") || info.modId.equals("forge")) {
+                    if (info.modId == null || info.modId.equals("minecraft") || info.modId.equals("forge")
+                            || info.modId.equals("neoforge")) {
                         info.modId = info.modIds.isEmpty() ? null : info.modIds.get(0);
                     }
                     verifiedClientArtifacts.put(entry.getKey(), info);
@@ -951,14 +950,16 @@ public class ServerSideManager {
         if (values == null) return new ArrayList<>();
         return values.stream().filter(Objects::nonNull)
                 .filter(value -> value.matches("[a-z][a-z0-9_]{0,127}"))
-                .filter(value -> !value.equals("minecraft") && !value.equals("forge"))
+                .filter(value -> !value.equals("minecraft") && !value.equals("forge")
+                        && !value.equals("neoforge"))
                 .distinct().limit(128).collect(Collectors.toCollection(ArrayList::new));
     }
 
     private static List<String> readModIds(Path jar) {
         List<String> ids = new ArrayList<>();
         try (ZipFile zip = new ZipFile(jar.toFile())) {
-            ZipEntry entry = zip.getEntry("META-INF/mods.toml");
+            ZipEntry entry = zip.getEntry("META-INF/neoforge.mods.toml");
+            if (entry == null) entry = zip.getEntry("META-INF/mods.toml");
             if (entry == null) return ids;
             try (InputStream input = zip.getInputStream(entry)) {
                 String toml = new String(input.readAllBytes(), StandardCharsets.UTF_8);
@@ -973,7 +974,8 @@ public class ServerSideManager {
                     if (!inModsSection) continue;
                     Matcher matcher = modIdPattern.matcher(line);
                     if (matcher.find() && !ids.contains(matcher.group(1))
-                            && !matcher.group(1).equals("minecraft") && !matcher.group(1).equals("forge")) {
+                            && !matcher.group(1).equals("minecraft") && !matcher.group(1).equals("forge")
+                            && !matcher.group(1).equals("neoforge")) {
                         ids.add(matcher.group(1));
                         if (ids.size() >= 128) break;
                     }

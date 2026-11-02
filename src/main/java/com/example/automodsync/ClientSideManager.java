@@ -9,18 +9,16 @@ import net.minecraft.client.gui.components.*;
 import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
-import net.minecraftforge.api.distmarker.Dist;
-import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
-import net.minecraftforge.client.event.RegisterClientCommandsEvent;
-import net.minecraftforge.client.event.ScreenEvent;
-import net.minecraftforge.eventbus.api.SubscribeEvent;
-import net.minecraftforge.fml.ModContainer;
-import net.minecraftforge.fml.ModList;
-import net.minecraftforge.fml.IExtensionPoint;
-import net.minecraftforge.network.NetworkConstants;
-import net.minecraftforge.fml.common.Mod;
-import net.minecraftforge.fml.loading.FMLPaths;
-import net.minecraftforge.forgespi.language.IModInfo;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.ModList;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.fml.loading.FMLPaths;
+import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
+import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
+import net.neoforged.neoforge.client.event.ScreenEvent;
+import net.neoforged.neoforge.network.PacketDistributor;
+import net.neoforged.neoforgespi.language.IModInfo;
 import org.slf4j.Logger;
 
 import java.io.*;
@@ -41,7 +39,7 @@ import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
-@Mod.EventBusSubscriber(modid = ModSyncMain.MODID, bus = Mod.EventBusSubscriber.Bus.FORGE, value = Dist.CLIENT)
+@EventBusSubscriber(modid = ModSyncMain.MODID, value = Dist.CLIENT)
 public class ClientSideManager {
 
     private static final Logger LOGGER = LogUtils.getLogger();
@@ -243,7 +241,7 @@ public class ClientSideManager {
                 statesById.computeIfAbsent(id, ignored -> new ServerSideManager.AdminModState(
                         id, "", "", previousById.get(id), baselineKnown, false, false));
             }
-            ModSyncMain.CHANNEL.sendToServer(new ModSyncMain.VerificationResponsePacket(
+            PacketDistributor.sendToServer(new ModSyncMain.VerificationResponsePacket(
                     candidateVersion, new ArrayList<>(statesById.values())));
         });
     }
@@ -254,7 +252,7 @@ public class ClientSideManager {
         if (size <= 0 || size > 512L * 1024L * 1024L) {
             throw new IOException("administrator client artifact exceeds upload limit: " + file.getFileName());
         }
-        ModSyncMain.CHANNEL.sendToServer(new ModSyncMain.AdminArtifactStartPacket(candidateVersion,
+        PacketDistributor.sendToServer(new ModSyncMain.AdminArtifactStartPacket(candidateVersion,
                 file.getFileName().toString(), hash, size, new ArrayList<>(modIds)));
         byte[] buffer = new byte[30 * 1024];
         long offset = 0;
@@ -262,12 +260,12 @@ public class ClientSideManager {
             int read;
             while ((read = input.read(buffer)) != -1) {
                 byte[] chunk = read == buffer.length ? buffer.clone() : Arrays.copyOf(buffer, read);
-                ModSyncMain.CHANNEL.sendToServer(new ModSyncMain.AdminArtifactChunkPacket(
+                PacketDistributor.sendToServer(new ModSyncMain.AdminArtifactChunkPacket(
                         candidateVersion, hash, offset, chunk));
                 offset += read;
             }
         }
-        ModSyncMain.CHANNEL.sendToServer(new ModSyncMain.AdminArtifactCompletePacket(candidateVersion, hash));
+        PacketDistributor.sendToServer(new ModSyncMain.AdminArtifactCompletePacket(candidateVersion, hash));
     }
 
     public static void commitAdministratorVerification(int version, int revision) {
@@ -920,7 +918,8 @@ public class ClientSideManager {
         }
         if (!result.isEmpty()) return result;
         try (ZipFile z = new ZipFile(jarPath.toFile())) {
-            ZipEntry t = z.getEntry("META-INF/mods.toml");
+            ZipEntry t = z.getEntry("META-INF/neoforge.mods.toml");
+            if (t == null) t = z.getEntry("META-INF/mods.toml");
             if (t != null) {
                 try (InputStream i = z.getInputStream(t)) {
                     String content = new String(i.readAllBytes(), StandardCharsets.UTF_8);
@@ -934,7 +933,8 @@ public class ClientSideManager {
                         }
                         if (!inModsSection) continue;
                         Matcher m = p.matcher(line);
-                        if (m.find() && !m.group(1).equals("minecraft") && !m.group(1).equals("forge")) {
+                        if (m.find() && !m.group(1).equals("minecraft") && !m.group(1).equals("forge")
+                                && !m.group(1).equals("neoforge")) {
                             result.add(m.group(1));
                         }
                     }
@@ -1111,7 +1111,7 @@ public class ClientSideManager {
             this.addRenderableWidget(Button.builder(Component.literal("返回"), b -> this.minecraft.setScreen(parent)).bounds(this.width / 2 - 50, this.height - 50, 100, 20).build());
         }
         @Override public void render(GuiGraphics g, int mx, int my, float pt) {
-            this.renderBackground(g); super.render(g, mx, my, pt);
+            super.render(g, mx, my, pt);
             int cx = this.width / 2;
             int cy = this.height / 2;
             g.drawCenteredString(font, "§l使用说明", cx, 40, 0xFFFFFF);
@@ -1137,7 +1137,7 @@ public class ClientSideManager {
             this.addRenderableWidget(Button.builder(Component.literal("?"), b -> { this.minecraft.setScreen(new GuideScreen(this)); }).bounds(this.width - 30, 10, 20, 20).build());
         }
         @Override public void render(GuiGraphics g, int mx, int my, float pt) {
-            renderBackground(g); super.render(g, mx, my, pt);
+            super.render(g, mx, my, pt);
             if (!statusText.isEmpty()) g.drawCenteredString(font, statusText, this.width / 2, this.height / 2 + 30, 0xFF5555);
         }
         private void startCheck() {
@@ -1171,7 +1171,7 @@ public class ClientSideManager {
         }
         @Override protected void init() {
             int cx = this.width / 2;
-            modList = new ModListWidget(this.minecraft, this.width, this.height, 65, this.height - 60, 24);
+            modList = new ModListWidget(this.minecraft, this.width, Math.max(24, this.height - 125), 65, 24);
             actionItems.sort(Comparator.comparingInt(this::getTypePriority));
             String lastType = "";
             for (ModActionItem item : actionItems) {
@@ -1191,7 +1191,7 @@ public class ClientSideManager {
             this.addRenderableWidget(Button.builder(Component.literal("取消"), b -> this.minecraft.setScreen(parent)).bounds(cx - 50, this.height - 55, 100, 20).build());
         }
         @Override public void render(GuiGraphics g, int mx, int my, float pt) {
-            this.renderBackground(g); if (modList != null) modList.render(g, mx, my, pt); super.render(g, mx, my, pt);
+            super.render(g, mx, my, pt);
             int cx = this.width / 2;
             int cy = 10;
             g.drawCenteredString(font, "§l同步清单确认", cx, cy, 0xFFFFFF);
@@ -1526,7 +1526,7 @@ public class ClientSideManager {
         }
     }
     public static class ModListWidget extends ObjectSelectionList<ModListWidget.BaseEntry> {
-        public ModListWidget(Minecraft mc, int w, int h, int t, int b, int ih) { super(mc, w, h, t, b, ih); }
+        public ModListWidget(Minecraft mc, int width, int height, int y, int itemHeight) { super(mc, width, height, y, itemHeight); }
         @Override public int getRowWidth() { return 300; }
         @Override protected int getScrollbarPosition() { return this.width / 2 + 150; }
         public void add(BaseEntry e) { this.addEntry(e); }

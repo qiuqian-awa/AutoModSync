@@ -1,5 +1,13 @@
 === AutoModSync Changelog ===
 
+v4.0.0 (2026-11-02)
+- 升级：目标平台改为 Minecraft 1.21.1 + NeoForge 21.1.248（Java 21）。
+- 迁移：Forge SimpleChannel 改为 NeoForge CustomPacketPayload / RegisterPayloadHandlersEvent。
+- 迁移：ForgeConfigSpec 改为 ModConfigSpec，META-INF/mods.toml 改为 META-INF/neoforge.mods.toml。
+- 适配：1.21.1 的 Screen.renderBackground、ObjectSelectionList 构造器和聊天点击事件 API。
+- 适配：模组需求检测同时读取 neoforge.mods.toml 与旧 mods.toml，并兼容 21.1 移除 DisplayTest 后的默认保守策略。
+- 资源：pack_format 更新为 34。
+
 v3.2.1 (2026-07-28)
 - 修复：AutoModSync 自身升级后不再被旧客户端快照判定为需要本地自愈。
 - 修复：成功进入同一版本服务器后，由版本包触发稳定连接复核并刷新兼容模组快照。

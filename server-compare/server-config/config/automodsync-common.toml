@@ -1,0 +1,14 @@
+[general]
+	#HTTP Server Port
+	# Default: 8899
+	# Range: 1024 ~ 65535
+	serverPort = 8899
+	#Number of HTTP worker threads used for manifests and file downloads.
+	#Increase this when many clients synchronize at the same time. Recommended range: 4-16.
+	# Default: 8
+	# Range: 2 ~ 64
+	httpWorkerThreads = 8
+	#Public URL for clients
+	syncUrl = "http://lt.cencenc.com:20016"
+	#Allow rules.json to delete directories recursively. DANGEROUS!
+	allowDirectoryDeletion = false

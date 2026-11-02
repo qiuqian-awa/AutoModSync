@@ -1,75 +1,108 @@
 plugins {
+    id 'java'
     id 'eclipse'
     id 'idea'
     id 'maven-publish'
-    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
 }
 
-// === 文件名生成逻辑 ===
-// 最终文件名 = archivesBaseName - version .jar
-// 结果示例: AutoModSync-1.20.1-2.0.0.jar
+// Final file name: AutoModSync-1.21.1-4.0.0.jar
 version = "${minecraft_version}-${mod_version}"
-group = 'com.example.automodsync' // 你的包名
-base.archivesName = archives_base_name // 读取 gradle.properties 里的配置
+group = 'com.example.automodsync'
+base.archivesName = archives_base_name
 
-java.toolchain.languageVersion = JavaLanguageVersion.of(17)
-
-println "Java: ${System.getProperty('java.version')} JVM: ${System.getProperty('java.vm.version')} (${System.getProperty('java.vendor')} Arch: ${System.getProperty('os.arch')}"
-
-minecraft {
-    mappings channel: 'official', version: minecraft_version
-    copyIdeResources = true
-
-    runs {
-        configureEach {
-            workingDirectory project.file('run')
-            property 'forge.logging.markers', 'REGISTRIES'
-            property 'forge.logging.console.level', 'debug'
-        }
-
-        client {
-            property 'forge.enabledGameTestNamespaces', mod_id
-        }
-
-        server {
-            property 'forge.enabledGameTestNamespaces', mod_id
-            // 如果要在开发环境测试服务端，可以取消下面注释
-            // args '--nogui'
-        }
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
     }
 }
 
-sourceSets.main.resources { srcDir 'src/generated/resources' }
+println "Java: ${System.getProperty('java.version')} JVM: ${System.getProperty('java.vm.version')} (${System.getProperty('java.vendor')} Arch: ${System.getProperty('os.arch')})"
+
+// ---------------------------------------------------------------------------
+// Local NeoForge development classpath
+//
+// maven.neoforged.net is not reachable from this machine.  A complete NeoForge
+// 1.21.1 installation and the NeoFormRuntime cache are already available
+// locally, so the build uses those jars directly instead of downloading them.
+// This keeps `gradle build` completely offline.
+//
+// The official-mapped Minecraft + NeoForge classes come from NeoFormRuntime's
+// compiledWithNeoForge output.  The requested NeoForge version's universal and
+// client jars are put first on the classpath so 21.1.248 APIs take precedence.
+// ---------------------------------------------------------------------------
+def librariesDir = file(project.findProperty('minecraftLibrariesDir') ?: 'D:/mc/.minecraft/libraries')
+def nfrtCacheDir = file("${gradle.gradleUserHomeDir}/caches/neoformruntime/intermediate_results")
+
+def nfUniversal = file("${librariesDir}/net/neoforged/neoforge/${neo_version}/neoforge-${neo_version}-universal.jar")
+def nfClient = file("${librariesDir}/net/neoforged/neoforge/${neo_version}/neoforge-${neo_version}-client.jar")
+// Pin the FML/bus jars that ship with NeoForge 21.1.248.  The libraries folder
+// also contains newer loaders (for 1.21.5/1.21.11) whose annotations differ.
+def nfLoader = file("${librariesDir}/net/neoforged/fancymodloader/loader/4.0.43/loader-4.0.43.jar")
+def nfBus = file("${librariesDir}/net/neoforged/bus/8.0.5/bus-8.0.5.jar")
+
+def nfrtOverride = project.findProperty('neoformRuntimeJar')
+def nfrtCandidates = fileTree(dir: nfrtCacheDir, include: 'compiledWithNeoForge_*_output.jar').files
+def nfrtJar = nfrtOverride != null ? file(nfrtOverride)
+        : (nfrtCandidates.isEmpty() ? null : nfrtCandidates.max { it.lastModified() })
+
+if (!librariesDir.isDirectory()) {
+    throw new GradleException("Minecraft libraries directory not found: ${librariesDir}. " +
+            "Pass -PminecraftLibrariesDir=<path-to-.minecraft/libraries>.")
+}
+if (!nfUniversal.isFile() || !nfClient.isFile()) {
+    throw new GradleException("NeoForge ${neo_version} is not installed under ${librariesDir}/net/neoforged/neoforge. " +
+            "Install NeoForge ${neo_version} for Minecraft ${minecraft_version} first.")
+}
+if (nfrtJar == null || !nfrtJar.isFile()) {
+    throw new GradleException("NeoFormRuntime compiledWithNeoForge output not found under ${nfrtCacheDir}. " +
+            "Build any NeoForge 1.21.1 project once, or pass a prepared jar via -PneoformRuntimeJar=... .")
+}
+if (!nfLoader.isFile() || !nfBus.isFile()) {
+    throw new GradleException("NeoForge 21.1 FML libraries are missing under ${librariesDir}. " +
+            "Expected loader-4.0.43.jar and bus-8.0.5.jar.")
+}
 
 dependencies {
-    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+    // Order matters: 21.1.248 NeoForge classes must win over cached 21.1.233 copies.
+    compileOnly files(nfUniversal, nfClient, nfLoader, nfBus, nfrtJar)
+    compileOnly fileTree(dir: librariesDir, include: '**/*.jar')
 }
 
-// === 关键修复: 解决 JDK 模块化限制导致的编译错误 ===
+repositories {
+    // Intentionally empty: this build is fully local/offline.
+}
+
 tasks.withType(JavaCompile).configureEach {
-    options.encoding = 'UTF-8' // 确保中文注释不乱码
-    // 允许访问 com.sun.net.httpserver 包
-    options.compilerArgs += ['--add-exports', 'jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED']
+    options.encoding = 'UTF-8'
+    options.compilerArgs += [
+            '--add-modules', 'jdk.httpserver',
+            '--add-exports', 'jdk.httpserver/com.sun.net.httpserver=ALL-UNNAMED'
+    ]
 }
 
-// 自动将 gradle.properties 中的变量注入到 mods.toml
+// Inject gradle.properties values into the NeoForge metadata.
 tasks.named('processResources', ProcessResources).configure {
     var replaceProperties = [
-            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
-            forge_version: forge_version, forge_version_range: forge_version_range,
-            loader_version_range: loader_version_range,
-            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
-            mod_authors: mod_authors, mod_description: mod_description,
-            pack_format: pack_format
+            minecraft_version      : minecraft_version,
+            minecraft_version_range: minecraft_version_range,
+            neo_version            : neo_version,
+            neo_version_range      : neo_version_range,
+            loader_version_range   : loader_version_range,
+            mod_id                 : mod_id,
+            mod_name               : mod_name,
+            mod_license            : mod_license,
+            mod_version            : mod_version,
+            mod_authors            : mod_authors,
+            mod_description        : mod_description,
+            pack_format            : pack_format
     ]
     inputs.properties replaceProperties
 
-    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
         expand replaceProperties + [project: project]
     }
 }
 
-// 生成 jar 包时的元数据
 tasks.named('jar', Jar).configure {
     manifest {
         attributes([

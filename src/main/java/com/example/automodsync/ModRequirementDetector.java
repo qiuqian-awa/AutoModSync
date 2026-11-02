@@ -1,9 +1,7 @@
 package com.example.automodsync;
 
-import net.minecraftforge.fml.IExtensionPoint;
-import net.minecraftforge.fml.ModContainer;
-import net.minecraftforge.fml.ModList;
-import net.minecraftforge.forgespi.language.IModInfo;
+import net.neoforged.neoforgespi.language.IConfigurable;
+import net.neoforged.neoforgespi.language.IModInfo;
 
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -19,8 +17,15 @@ import java.util.zip.ZipFile;
 
 /**
  * Determines whether a mod loaded on the dedicated server must also be present
- * on connecting clients. DisplayTest predicates are deliberately not executed:
- * they describe server-list compatibility and are not a reliable side detector.
+ * on connecting clients.
+ *
+ * <p>NeoForge 21.1 removed {@code IExtensionPoint.DisplayTest}; client/server
+ * compatibility is now negotiated through the configuration-phase handshake.
+ * The old {@code clientSideOnly} and {@code displayTest} metadata keys are still
+ * understood when they are present (for example in legacy jars), but a mod
+ * without an explicit declaration is conservatively treated as client-required.
+ * That is the safe direction: a missing shared mod would otherwise be silently
+ * left out of the client update.</p>
  */
 public final class ModRequirementDetector {
     private ModRequirementDetector() {}
@@ -50,58 +55,29 @@ public final class ModRequirementDetector {
     );
 
     public static Result detect(IModInfo mod, Path jarPath) {
-        Result runtime = detectRuntime(mod);
-        if (runtime.requirement == Requirement.SERVER_ONLY || runtime.requirement == Requirement.OPTIONAL) return runtime;
-
         Result loaded = detectLoadedMetadata(mod);
         if (loaded.requirement != Requirement.UNKNOWN) return loaded;
 
         Result jar = detectJarMetadata(jarPath);
         if (jar.requirement != Requirement.UNKNOWN) return jar;
 
-        // A mod that is loaded by a dedicated server is client-required unless
-        // it explicitly advertises otherwise. This is safer than silently
-        // omitting a genuinely shared mod from a client update.
         return new Result(Requirement.REQUIRED, Confidence.MEDIUM,
-                "dedicated server mod with no explicit remote-ignore declaration");
+                "mod loaded on a dedicated server with no explicit client-requirement declaration");
     }
 
     public static Result detectJar(Path jarPath) {
         Result result = detectJarMetadata(jarPath);
         if (result.requirement != Requirement.UNKNOWN) return result;
         return new Result(Requirement.REQUIRED, Confidence.MEDIUM,
-                "JAR has no explicit remote-ignore declaration");
-    }
-
-    private static Result detectRuntime(IModInfo mod) {
-        try {
-            Optional<? extends ModContainer> container = ModList.get().getModContainerById(mod.getModId());
-            if (container.isEmpty()) return unknown("no runtime ModContainer");
-            Optional<IExtensionPoint.DisplayTest> extension =
-                    container.get().getCustomExtension(IExtensionPoint.DisplayTest.class);
-            if (extension.isEmpty()) return unknown("no runtime DisplayTest");
-
-            Object supplied = extension.get().suppliedVersion().get();
-            if (IExtensionPoint.DisplayTest.IGNORESERVERONLY.equals(String.valueOf(supplied))) {
-                return new Result(Requirement.SERVER_ONLY, Confidence.HIGH,
-                        "runtime DisplayTest supplied SERVER_ONLY");
-            }
-            if (String.valueOf(supplied).isEmpty()) {
-                return new Result(Requirement.OPTIONAL, Confidence.MEDIUM,
-                        "runtime DisplayTest supplied IGNORE_ALL marker");
-            }
-            return unknown("custom DisplayTest without SERVER_ONLY marker");
-        } catch (Exception ignored) {
-            return unknown("runtime DisplayTest unavailable");
-        }
+                "JAR has no explicit client-requirement declaration");
     }
 
     private static Result detectLoadedMetadata(IModInfo mod) {
         try {
-            var config = mod.getOwningFile().getFile().getModFileInfo().getConfig();
-            boolean clientSideOnly = config.getConfigElement("clientSideOnly")
-                    .map(Boolean.TRUE::equals).orElse(false);
-            if (clientSideOnly) {
+            IConfigurable config = mod.getOwningFile().getConfig();
+
+            Optional<Object> clientSideOnly = config.getConfigElement("clientSideOnly");
+            if (clientSideOnly.isPresent() && Boolean.TRUE.equals(clientSideOnly.get())) {
                 return new Result(Requirement.OPTIONAL, Confidence.HIGH,
                         "loaded metadata clientSideOnly=true");
             }
@@ -116,8 +92,14 @@ public final class ModRequirementDetector {
 
     private static Result detectJarMetadata(Path jarPath) {
         try (ZipFile zip = new ZipFile(jarPath.toFile())) {
-            ZipEntry entry = zip.getEntry("META-INF/mods.toml");
-            if (entry == null) return unknown("no META-INF/mods.toml");
+            ZipEntry entry = zip.getEntry("META-INF/neoforge.mods.toml");
+            String sourceName = "META-INF/neoforge.mods.toml";
+            if (entry == null) {
+                entry = zip.getEntry("META-INF/mods.toml");
+                sourceName = "META-INF/mods.toml";
+            }
+            if (entry == null) return unknown("no mod metadata");
+
             try (InputStream input = zip.getInputStream(entry);
                  BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
                 String line;
@@ -130,10 +112,10 @@ public final class ModRequirementDetector {
                     String value = firstNonNull(matcher.group(2), matcher.group(3), matcher.group(4));
                     if ("clientSideOnly".equalsIgnoreCase(key) && "true".equalsIgnoreCase(value)) {
                         return new Result(Requirement.OPTIONAL, Confidence.HIGH,
-                                "parsed mods.toml clientSideOnly=true");
+                                "parsed " + sourceName + " clientSideOnly=true");
                     }
                     if ("displayTest".equalsIgnoreCase(key)) {
-                        Result result = fromDisplayTest(value, "parsed mods.toml");
+                        Result result = fromDisplayTest(value, "parsed " + sourceName);
                         if (result.requirement != Requirement.UNKNOWN) return result;
                     }
                 }

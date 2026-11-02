@@ -1,56 +1,56 @@
 package com.example.automodsync;
 
 import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraftforge.api.distmarker.Dist;
-import net.minecraftforge.common.ForgeConfigSpec;
-import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.event.entity.player.PlayerEvent;
-import net.minecraftforge.event.server.ServerStartingEvent;
-import net.minecraftforge.event.server.ServerStoppingEvent;
-import net.minecraftforge.eventbus.api.SubscribeEvent;
-import net.minecraftforge.fml.DistExecutor;
-import net.minecraftforge.fml.IExtensionPoint;
-import net.minecraftforge.fml.ModLoadingContext;
-import net.minecraftforge.fml.common.Mod;
-import net.minecraftforge.fml.config.ModConfig;
-import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
-import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext;
-import net.minecraftforge.network.NetworkConstants;
-import net.minecraftforge.network.NetworkRegistry;
-import net.minecraftforge.network.PacketDistributor;
-import net.minecraftforge.network.simple.SimpleChannel;
-import org.apache.commons.lang3.tuple.Pair;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.ModContainer;
+import net.neoforged.fml.common.Mod;
+import net.neoforged.fml.config.ModConfig;
+import net.neoforged.neoforge.common.ModConfigSpec;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.server.ServerStartingEvent;
+import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.network.PacketDistributor;
+import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
+import net.neoforged.neoforge.network.registration.PayloadRegistrar;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Supplier;
 
 @Mod(ModSyncMain.MODID)
 public class ModSyncMain {
     public static final String MODID = "automodsync";
+    private static final String PROTOCOL = "8";
 
     public static final CommonConfig CONFIG;
-    public static final ForgeConfigSpec CONFIG_SPEC;
-    static {
-        Pair<CommonConfig, ForgeConfigSpec> pair = new ForgeConfigSpec.Builder().configure(CommonConfig::new);
-        CONFIG_SPEC = pair.getRight();
-        CONFIG = pair.getLeft();
-    }
-    public static class CommonConfig {
-        public final ForgeConfigSpec.IntValue serverPort;
-        public final ForgeConfigSpec.IntValue httpWorkerThreads;
-        public final ForgeConfigSpec.ConfigValue<String> syncUrl;
-        public final ForgeConfigSpec.BooleanValue allowDirectoryDeletion;
+    public static final ModConfigSpec CONFIG_SPEC;
 
-        public CommonConfig(ForgeConfigSpec.Builder builder) {
+    static {
+        ModConfigSpec.Builder builder = new ModConfigSpec.Builder();
+        CONFIG = new CommonConfig(builder);
+        CONFIG_SPEC = builder.build();
+    }
+
+    public static class CommonConfig {
+        public final ModConfigSpec.ConfigValue<Integer> serverPort;
+        public final ModConfigSpec.ConfigValue<Integer> httpWorkerThreads;
+        public final ModConfigSpec.ConfigValue<String> syncUrl;
+        public final ModConfigSpec.ConfigValue<Boolean> allowDirectoryDeletion;
+
+        public CommonConfig(ModConfigSpec.Builder builder) {
             builder.push("general");
-            serverPort = builder.comment("HTTP Server Port").defineInRange("serverPort", 8899, 1024, 65535);
+            serverPort = builder.comment("HTTP Server Port")
+                    .defineInRange("serverPort", 8899, 1024, 65535, Integer.class);
             httpWorkerThreads = builder.comment(
                             "Number of HTTP worker threads used for manifests and file downloads.",
                             "Increase this when many clients synchronize at the same time. Recommended range: 4-16.")
-                    .defineInRange("httpWorkerThreads", 8, 2, 64);
+                    .defineInRange("httpWorkerThreads", 8, 2, 64, Integer.class);
             syncUrl = builder.comment("Public URL for clients").define("syncUrl", "");
             allowDirectoryDeletion = builder.comment("Allow rules.json to delete directories recursively. DANGEROUS!")
                     .define("allowDirectoryDeletion", false);
@@ -58,48 +58,80 @@ public class ModSyncMain {
         }
     }
 
-    private static final String PROTOCOL = "8";
-    public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
-            new ResourceLocation(MODID, "main"), () -> PROTOCOL, PROTOCOL::equals, PROTOCOL::equals
-    );
-
-    public ModSyncMain() {
-        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, CONFIG_SPEC);
-        ModLoadingContext.get().registerExtensionPoint(IExtensionPoint.DisplayTest.class,
-                () -> new IExtensionPoint.DisplayTest(() -> NetworkConstants.IGNORESERVERONLY, (r, i) -> true));
-
-        FMLJavaModLoadingContext.get().getModEventBus().addListener(this::setup);
-        MinecraftForge.EVENT_BUS.register(this);
+    public ModSyncMain(IEventBus modEventBus, ModContainer modContainer) {
+        modContainer.registerConfig(ModConfig.Type.COMMON, CONFIG_SPEC);
+        modEventBus.addListener(ModSyncMain::registerPayloads);
+        NeoForge.EVENT_BUS.register(ModSyncMain.class);
     }
 
-    private void setup(final FMLCommonSetupEvent event) {
-        int id = 0;
-        CHANNEL.registerMessage(id++, SyncUrlPacket.class, SyncUrlPacket::encode, SyncUrlPacket::decode, SyncUrlPacket::handle);
-        // 🟢 恢复版本包注册
-        CHANNEL.registerMessage(id++, VersionPacket.class, VersionPacket::encode, VersionPacket::decode, VersionPacket::handle);
-        CHANNEL.registerMessage(id++, VerificationRequestPacket.class, VerificationRequestPacket::encode,
-                VerificationRequestPacket::decode, VerificationRequestPacket::handle);
-        CHANNEL.registerMessage(id++, AdminArtifactStartPacket.class, AdminArtifactStartPacket::encode,
-                AdminArtifactStartPacket::decode, AdminArtifactStartPacket::handle);
-        CHANNEL.registerMessage(id++, AdminArtifactChunkPacket.class, AdminArtifactChunkPacket::encode,
-                AdminArtifactChunkPacket::decode, AdminArtifactChunkPacket::handle);
-        CHANNEL.registerMessage(id++, AdminArtifactCompletePacket.class, AdminArtifactCompletePacket::encode,
-                AdminArtifactCompletePacket::decode, AdminArtifactCompletePacket::handle);
-        CHANNEL.registerMessage(id++, VerificationResponsePacket.class, VerificationResponsePacket::encode,
-                VerificationResponsePacket::decode, VerificationResponsePacket::handle);
-        CHANNEL.registerMessage(id++, VerificationCompletePacket.class, VerificationCompletePacket::encode,
-                VerificationCompletePacket::decode, VerificationCompletePacket::handle);
+    private static void registerPayloads(RegisterPayloadHandlersEvent event) {
+        PayloadRegistrar registrar = event.registrar(PROTOCOL);
+
+        // Server -> client
+        registrar.playToClient(SyncUrlPacket.TYPE, SyncUrlPacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> ClientPayloadHandler.onSyncUrl(msg.url)));
+        registrar.playToClient(VersionPacket.TYPE, VersionPacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> ClientPayloadHandler.onServerVersion(
+                        msg.ver, msg.revision, msg.status)));
+        registrar.playToClient(VerificationRequestPacket.TYPE, VerificationRequestPacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> ClientPayloadHandler.onVerificationRequest(
+                        msg.candidateVersion, msg.changedModIds, msg.changedServerHashes)));
+        registrar.playToClient(VerificationCompletePacket.TYPE, VerificationCompletePacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> ClientPayloadHandler.onVerificationComplete(
+                        msg.version, msg.revision)));
+
+        // Client -> server
+        registrar.playToServer(AdminArtifactStartPacket.TYPE, AdminArtifactStartPacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> {
+                    if (ctx.player() instanceof ServerPlayer sender) {
+                        ServerSideManager.beginAdminArtifactUpload(sender, msg.candidateVersion,
+                                msg.fileName, msg.hash, msg.size, msg.modIds);
+                    }
+                }));
+        registrar.playToServer(AdminArtifactChunkPacket.TYPE, AdminArtifactChunkPacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> {
+                    if (ctx.player() instanceof ServerPlayer sender) {
+                        ServerSideManager.appendAdminArtifactUpload(sender, msg.candidateVersion,
+                                msg.hash, msg.offset, msg.data);
+                    }
+                }));
+        registrar.playToServer(AdminArtifactCompletePacket.TYPE, AdminArtifactCompletePacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> {
+                    if (ctx.player() instanceof ServerPlayer sender) {
+                        ServerSideManager.finishAdminArtifactUpload(sender, msg.candidateVersion, msg.hash);
+                    }
+                }));
+        registrar.playToServer(VerificationResponsePacket.TYPE, VerificationResponsePacket.STREAM_CODEC,
+                (msg, ctx) -> ctx.enqueueWork(() -> {
+                    if (ctx.player() instanceof ServerPlayer sender) {
+                        handleVerificationResponse(sender, msg);
+                    }
+                }));
+    }
+
+    private static void handleVerificationResponse(ServerPlayer sender, VerificationResponsePacket msg) {
+        if (!ServerSideManager.submitAdminVerification(sender, msg.candidateVersion, msg.states)) return;
+        boolean clientChangesPublished = ServerSideManager.getCurrentVersion() > msg.candidateVersion;
+        VersionPacket published = new VersionPacket(ServerSideManager.getCurrentVersion(),
+                ServerSideManager.getCurrentRevision(), ServerSideManager.getCurrentVerificationStatus());
+        PacketDistributor.sendToAllPlayers(published);
+        PacketDistributor.sendToPlayer(sender, new VerificationCompletePacket(
+                ServerSideManager.getCurrentVersion(), ServerSideManager.getCurrentRevision()));
+        if (clientChangesPublished) {
+            sender.sendSystemMessage(Component.literal(
+                    "§a[AutoModSync] 检测到客户端改动，已自动推送 v"
+                            + ServerSideManager.getCurrentVersion() + "（候选版本 +1）"));
+        }
     }
 
     @SubscribeEvent
-    public void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
+    public static void onPlayerLoggedIn(PlayerEvent.PlayerLoggedInEvent event) {
         if (event.getEntity() instanceof ServerPlayer serverPlayer) {
             String url = CONFIG.syncUrl.get();
             if (url != null && !url.isEmpty()) {
-                CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer), new SyncUrlPacket(url));
+                PacketDistributor.sendToPlayer(serverPlayer, new SyncUrlPacket(url));
             }
-            // 🟢 发送服务端版本号
-            CHANNEL.send(PacketDistributor.PLAYER.with(() -> serverPlayer), new VersionPacket(
+            PacketDistributor.sendToPlayer(serverPlayer, new VersionPacket(
                     ServerSideManager.getCurrentVersion(), ServerSideManager.getCurrentRevision(),
                     ServerSideManager.getCurrentVerificationStatus()));
             if (ServerSideManager.isVerificationAdministrator(serverPlayer)
@@ -109,7 +141,7 @@ public class ModSyncMain {
         }
     }
 
-    private void scheduleAdministratorVerification(ServerPlayer loginPlayer) {
+    private static void scheduleAdministratorVerification(ServerPlayer loginPlayer) {
         Thread stabilityCheck = new Thread(() -> {
             try {
                 Thread.sleep(10_000L);
@@ -125,7 +157,7 @@ public class ModSyncMain {
                         || activePlayer.hasDisconnected()
                         || !ServerSideManager.isVerificationAdministrator(activePlayer)
                         || !ServerSideManager.hasPendingVerification()) return;
-                CHANNEL.send(PacketDistributor.PLAYER.with(() -> activePlayer),
+                PacketDistributor.sendToPlayer(activePlayer,
                         new VerificationRequestPacket(ServerSideManager.getCurrentVersion(),
                                 ServerSideManager.getChangedModIdsForVerification(),
                                 ServerSideManager.getChangedModHashesForVerification()));
@@ -136,233 +168,267 @@ public class ModSyncMain {
     }
 
     @SubscribeEvent
-    public void onServerStarting(ServerStartingEvent event) {
+    public static void onServerStarting(ServerStartingEvent event) {
         if (event.getServer().isDedicatedServer()) ServerSideManager.startServerLogic();
     }
 
     @SubscribeEvent
-    public void onServerStopping(ServerStoppingEvent event) {
+    public static void onServerStopping(ServerStoppingEvent event) {
         ServerSideManager.stopServer();
     }
 
-    public static class SyncUrlPacket {
+    // ---------------------------------------------------------------------
+    // Payloads
+    // ---------------------------------------------------------------------
+
+    public static class SyncUrlPacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<SyncUrlPacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "sync_url"));
+        public static final StreamCodec<FriendlyByteBuf, SyncUrlPacket> STREAM_CODEC =
+                StreamCodec.of((buf, msg) -> buf.writeUtf(msg.url), buf -> new SyncUrlPacket(buf.readUtf()));
+
         private final String url;
-        public SyncUrlPacket(String url) { this.url = url; }
-        public static void encode(SyncUrlPacket msg, FriendlyByteBuf buf) { buf.writeUtf(msg.url); }
-        public static SyncUrlPacket decode(FriendlyByteBuf buf) { return new SyncUrlPacket(buf.readUtf()); }
-        public static void handle(SyncUrlPacket msg, Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ctx.get().enqueueWork(() -> {
-                DistExecutor.unsafeRunWhenOn(Dist.CLIENT, () -> () -> ClientSideManager.updateCachedUrl(msg.url));
-            });
-            ctx.get().setPacketHandled(true);
+
+        public SyncUrlPacket(String url) {
+            this.url = url == null ? "" : url;
+        }
+
+        @Override
+        public CustomPacketPayload.Type<SyncUrlPacket> type() {
+            return TYPE;
         }
     }
 
-    // 🟢 恢复版本包定义
-    public static class VersionPacket {
+    public static class VersionPacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<VersionPacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "version"));
+        public static final StreamCodec<FriendlyByteBuf, VersionPacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.ver);
+                    buf.writeInt(msg.revision);
+                    buf.writeEnum(msg.status);
+                },
+                buf -> new VersionPacket(buf.readInt(), buf.readInt(),
+                        buf.readEnum(ServerSideManager.VerificationStatus.class)));
+
         private final int ver;
         private final int revision;
         private final ServerSideManager.VerificationStatus status;
+
         public VersionPacket(int ver, int revision, ServerSideManager.VerificationStatus status) {
-            this.ver = ver; this.revision = revision; this.status = status;
+            this.ver = ver;
+            this.revision = revision;
+            this.status = status;
         }
-        public static void encode(VersionPacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.ver); buf.writeInt(msg.revision); buf.writeEnum(msg.status);
-        }
-        public static VersionPacket decode(FriendlyByteBuf buf) {
-            return new VersionPacket(buf.readInt(), buf.readInt(),
-                    buf.readEnum(ServerSideManager.VerificationStatus.class));
-        }
-        public static void handle(VersionPacket msg, Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ctx.get().enqueueWork(() -> {
-                // 安全调用客户端逻辑
-                DistExecutor.unsafeRunWhenOn(Dist.CLIENT,
-                        () -> () -> ClientSideManager.setServerVersion(msg.ver, msg.revision, msg.status));
-            });
-            ctx.get().setPacketHandled(true);
+
+        @Override
+        public CustomPacketPayload.Type<VersionPacket> type() {
+            return TYPE;
         }
     }
 
-    public static class VerificationRequestPacket {
+    public static class VerificationRequestPacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<VerificationRequestPacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "verification_request"));
+        public static final StreamCodec<FriendlyByteBuf, VerificationRequestPacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.candidateVersion);
+                    writeStrings(buf, msg.changedModIds, 128);
+                    writeStrings(buf, msg.changedServerHashes, 40);
+                },
+                buf -> new VerificationRequestPacket(buf.readInt(),
+                        readStrings(buf, 128), readStrings(buf, 40)));
+
         private final int candidateVersion;
         private final List<String> changedModIds;
         private final List<String> changedServerHashes;
+
         public VerificationRequestPacket(int candidateVersion, List<String> changedModIds,
                                          List<String> changedServerHashes) {
             this.candidateVersion = candidateVersion;
             this.changedModIds = changedModIds == null ? new ArrayList<>() : changedModIds;
             this.changedServerHashes = changedServerHashes == null ? new ArrayList<>() : changedServerHashes;
         }
-        public static void encode(VerificationRequestPacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.candidateVersion);
-            buf.writeCollection(msg.changedModIds, (target, value) -> target.writeUtf(value, 128));
-            buf.writeCollection(msg.changedServerHashes, (target, value) -> target.writeUtf(value, 40));
-        }
-        public static VerificationRequestPacket decode(FriendlyByteBuf buf) {
-            return new VerificationRequestPacket(buf.readInt(), buf.readList(source -> source.readUtf(128)),
-                    buf.readList(source -> source.readUtf(40)));
-        }
-        public static void handle(VerificationRequestPacket msg,
-                                  Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ctx.get().enqueueWork(() -> DistExecutor.unsafeRunWhenOn(Dist.CLIENT,
-                    () -> () -> ClientSideManager.respondToVerification(msg.candidateVersion,
-                            msg.changedModIds, msg.changedServerHashes)));
-            ctx.get().setPacketHandled(true);
+
+        @Override
+        public CustomPacketPayload.Type<VerificationRequestPacket> type() {
+            return TYPE;
         }
     }
 
-    public static class AdminArtifactStartPacket {
+    public static class AdminArtifactStartPacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<AdminArtifactStartPacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "admin_artifact_start"));
+        public static final StreamCodec<FriendlyByteBuf, AdminArtifactStartPacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.candidateVersion);
+                    buf.writeUtf(msg.fileName, 512);
+                    buf.writeUtf(msg.hash, 40);
+                    buf.writeLong(msg.size);
+                    writeStrings(buf, msg.modIds, 128);
+                },
+                buf -> new AdminArtifactStartPacket(buf.readInt(), buf.readUtf(512), buf.readUtf(40),
+                        buf.readLong(), readStrings(buf, 128)));
+
         private final int candidateVersion;
         private final String fileName;
         private final String hash;
         private final long size;
         private final List<String> modIds;
+
         public AdminArtifactStartPacket(int candidateVersion, String fileName, String hash,
                                         long size, List<String> modIds) {
-            this.candidateVersion = candidateVersion; this.fileName = fileName; this.hash = hash;
-            this.size = size; this.modIds = modIds == null ? new ArrayList<>() : modIds;
+            this.candidateVersion = candidateVersion;
+            this.fileName = fileName;
+            this.hash = hash;
+            this.size = size;
+            this.modIds = modIds == null ? new ArrayList<>() : modIds;
         }
-        public static void encode(AdminArtifactStartPacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.candidateVersion); buf.writeUtf(msg.fileName, 512);
-            buf.writeUtf(msg.hash, 40); buf.writeLong(msg.size);
-            buf.writeCollection(msg.modIds, (target, value) -> target.writeUtf(value, 128));
-        }
-        public static AdminArtifactStartPacket decode(FriendlyByteBuf buf) {
-            return new AdminArtifactStartPacket(buf.readInt(), buf.readUtf(512), buf.readUtf(40),
-                    buf.readLong(), buf.readList(source -> source.readUtf(128)));
-        }
-        public static void handle(AdminArtifactStartPacket msg,
-                                  Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ServerPlayer sender = ctx.get().getSender();
-            ctx.get().enqueueWork(() -> ServerSideManager.beginAdminArtifactUpload(sender,
-                    msg.candidateVersion, msg.fileName, msg.hash, msg.size, msg.modIds));
-            ctx.get().setPacketHandled(true);
+
+        @Override
+        public CustomPacketPayload.Type<AdminArtifactStartPacket> type() {
+            return TYPE;
         }
     }
 
-    public static class AdminArtifactChunkPacket {
+    public static class AdminArtifactChunkPacket implements CustomPacketPayload {
+        public static final int MAX_CHUNK_BYTES = 30 * 1024;
+        public static final CustomPacketPayload.Type<AdminArtifactChunkPacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "admin_artifact_chunk"));
+        public static final StreamCodec<FriendlyByteBuf, AdminArtifactChunkPacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.candidateVersion);
+                    buf.writeUtf(msg.hash, 40);
+                    buf.writeLong(msg.offset);
+                    buf.writeByteArray(msg.data);
+                },
+                buf -> new AdminArtifactChunkPacket(buf.readInt(), buf.readUtf(40), buf.readLong(),
+                        buf.readByteArray(MAX_CHUNK_BYTES)));
+
         private final int candidateVersion;
         private final String hash;
         private final long offset;
         private final byte[] data;
+
         public AdminArtifactChunkPacket(int candidateVersion, String hash, long offset, byte[] data) {
-            this.candidateVersion = candidateVersion; this.hash = hash; this.offset = offset; this.data = data;
+            this.candidateVersion = candidateVersion;
+            this.hash = hash;
+            this.offset = offset;
+            this.data = data;
         }
-        public static void encode(AdminArtifactChunkPacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.candidateVersion); buf.writeUtf(msg.hash, 40); buf.writeLong(msg.offset);
-            buf.writeByteArray(msg.data);
-        }
-        public static AdminArtifactChunkPacket decode(FriendlyByteBuf buf) {
-            return new AdminArtifactChunkPacket(buf.readInt(), buf.readUtf(40), buf.readLong(),
-                    buf.readByteArray(30 * 1024));
-        }
-        public static void handle(AdminArtifactChunkPacket msg,
-                                  Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ServerPlayer sender = ctx.get().getSender();
-            ctx.get().enqueueWork(() -> ServerSideManager.appendAdminArtifactUpload(sender,
-                    msg.candidateVersion, msg.hash, msg.offset, msg.data));
-            ctx.get().setPacketHandled(true);
+
+        @Override
+        public CustomPacketPayload.Type<AdminArtifactChunkPacket> type() {
+            return TYPE;
         }
     }
 
-    public static class AdminArtifactCompletePacket {
+    public static class AdminArtifactCompletePacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<AdminArtifactCompletePacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "admin_artifact_complete"));
+        public static final StreamCodec<FriendlyByteBuf, AdminArtifactCompletePacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.candidateVersion);
+                    buf.writeUtf(msg.hash, 40);
+                },
+                buf -> new AdminArtifactCompletePacket(buf.readInt(), buf.readUtf(40)));
+
         private final int candidateVersion;
         private final String hash;
+
         public AdminArtifactCompletePacket(int candidateVersion, String hash) {
-            this.candidateVersion = candidateVersion; this.hash = hash;
+            this.candidateVersion = candidateVersion;
+            this.hash = hash;
         }
-        public static void encode(AdminArtifactCompletePacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.candidateVersion); buf.writeUtf(msg.hash, 40);
-        }
-        public static AdminArtifactCompletePacket decode(FriendlyByteBuf buf) {
-            return new AdminArtifactCompletePacket(buf.readInt(), buf.readUtf(40));
-        }
-        public static void handle(AdminArtifactCompletePacket msg,
-                                  Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ServerPlayer sender = ctx.get().getSender();
-            ctx.get().enqueueWork(() -> ServerSideManager.finishAdminArtifactUpload(sender,
-                    msg.candidateVersion, msg.hash));
-            ctx.get().setPacketHandled(true);
+
+        @Override
+        public CustomPacketPayload.Type<AdminArtifactCompletePacket> type() {
+            return TYPE;
         }
     }
 
-    public static class VerificationResponsePacket {
+    public static class VerificationResponsePacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<VerificationResponsePacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "verification_response"));
+        public static final StreamCodec<FriendlyByteBuf, VerificationResponsePacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.candidateVersion);
+                    int count = Math.min(msg.states.size(), 2048);
+                    buf.writeVarInt(count);
+                    for (int i = 0; i < count; i++) {
+                        ServerSideManager.AdminModState state = msg.states.get(i);
+                        buf.writeUtf(state.modId == null ? "" : state.modId, 128);
+                        buf.writeUtf(state.fileName == null ? "" : state.fileName, 512);
+                        buf.writeUtf(state.hash == null ? "" : state.hash, 40);
+                        buf.writeUtf(state.previousHash == null ? "" : state.previousHash, 40);
+                        buf.writeBoolean(state.baselineKnown);
+                        buf.writeBoolean(state.administratorAddedClientArtifact);
+                        buf.writeBoolean(state.administratorRemovedClientArtifact);
+                    }
+                },
+                buf -> {
+                    int candidate = buf.readInt();
+                    int count = Math.min(buf.readVarInt(), 2048);
+                    List<ServerSideManager.AdminModState> result = new ArrayList<>(count);
+                    for (int i = 0; i < count; i++) {
+                        result.add(new ServerSideManager.AdminModState(
+                                buf.readUtf(128), buf.readUtf(512), buf.readUtf(40),
+                                buf.readUtf(40), buf.readBoolean(), buf.readBoolean(), buf.readBoolean()));
+                    }
+                    return new VerificationResponsePacket(candidate, result);
+                });
+
         private final int candidateVersion;
         private final List<ServerSideManager.AdminModState> states;
+
         public VerificationResponsePacket(int candidateVersion, List<ServerSideManager.AdminModState> states) {
             this.candidateVersion = candidateVersion;
             this.states = states == null ? new ArrayList<>() : states;
         }
-        public static void encode(VerificationResponsePacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.candidateVersion);
-            int count = Math.min(msg.states.size(), 2048);
-            buf.writeVarInt(count);
-            for (int i = 0; i < count; i++) {
-                ServerSideManager.AdminModState state = msg.states.get(i);
-                buf.writeUtf(state.modId == null ? "" : state.modId, 128);
-                buf.writeUtf(state.fileName == null ? "" : state.fileName, 512);
-                buf.writeUtf(state.hash == null ? "" : state.hash, 40);
-                buf.writeUtf(state.previousHash == null ? "" : state.previousHash, 40);
-                buf.writeBoolean(state.baselineKnown);
-                buf.writeBoolean(state.administratorAddedClientArtifact);
-                buf.writeBoolean(state.administratorRemovedClientArtifact);
-            }
-        }
-        public static VerificationResponsePacket decode(FriendlyByteBuf buf) {
-            int candidate = buf.readInt();
-            int count = Math.min(buf.readVarInt(), 2048);
-            List<ServerSideManager.AdminModState> result = new ArrayList<>();
-            for (int i = 0; i < count; i++) {
-                result.add(new ServerSideManager.AdminModState(
-                        buf.readUtf(128), buf.readUtf(512), buf.readUtf(40),
-                        buf.readUtf(40), buf.readBoolean(), buf.readBoolean(), buf.readBoolean()));
-            }
-            return new VerificationResponsePacket(candidate, result);
-        }
-        public static void handle(VerificationResponsePacket msg,
-                                  Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ServerPlayer sender = ctx.get().getSender();
-            ctx.get().enqueueWork(() -> {
-                if (ServerSideManager.submitAdminVerification(sender, msg.candidateVersion, msg.states)
-                        && sender != null) {
-                    boolean clientChangesPublished = ServerSideManager.getCurrentVersion() > msg.candidateVersion;
-                    VersionPacket published = new VersionPacket(ServerSideManager.getCurrentVersion(),
-                            ServerSideManager.getCurrentRevision(), ServerSideManager.getCurrentVerificationStatus());
-                    for (ServerPlayer player : sender.getServer().getPlayerList().getPlayers()) {
-                        CHANNEL.send(PacketDistributor.PLAYER.with(() -> player), published);
-                    }
-                    CHANNEL.send(PacketDistributor.PLAYER.with(() -> sender),
-                            new VerificationCompletePacket(ServerSideManager.getCurrentVersion(),
-                                    ServerSideManager.getCurrentRevision()));
-                    if (clientChangesPublished) {
-                        sender.sendSystemMessage(net.minecraft.network.chat.Component.literal(
-                                "§a[AutoModSync] 检测到客户端改动，已自动推送 v"
-                                        + ServerSideManager.getCurrentVersion() + "（候选版本 +1）"));
-                    }
-                }
-            });
-            ctx.get().setPacketHandled(true);
+
+        @Override
+        public CustomPacketPayload.Type<VerificationResponsePacket> type() {
+            return TYPE;
         }
     }
 
-    public static class VerificationCompletePacket {
+    public static class VerificationCompletePacket implements CustomPacketPayload {
+        public static final CustomPacketPayload.Type<VerificationCompletePacket> TYPE = new CustomPacketPayload.Type<>(
+                ResourceLocation.fromNamespaceAndPath(MODID, "verification_complete"));
+        public static final StreamCodec<FriendlyByteBuf, VerificationCompletePacket> STREAM_CODEC = StreamCodec.of(
+                (buf, msg) -> {
+                    buf.writeInt(msg.version);
+                    buf.writeInt(msg.revision);
+                },
+                buf -> new VerificationCompletePacket(buf.readInt(), buf.readInt()));
+
         private final int version;
         private final int revision;
+
         public VerificationCompletePacket(int version, int revision) {
-            this.version = version; this.revision = revision;
+            this.version = version;
+            this.revision = revision;
         }
-        public static void encode(VerificationCompletePacket msg, FriendlyByteBuf buf) {
-            buf.writeInt(msg.version); buf.writeInt(msg.revision);
+
+        @Override
+        public CustomPacketPayload.Type<VerificationCompletePacket> type() {
+            return TYPE;
         }
-        public static VerificationCompletePacket decode(FriendlyByteBuf buf) {
-            return new VerificationCompletePacket(buf.readInt(), buf.readInt());
+    }
+
+    private static void writeStrings(FriendlyByteBuf buf, List<String> values, int maxLength) {
+        int count = values == null ? 0 : Math.min(values.size(), 2048);
+        buf.writeVarInt(count);
+        for (int i = 0; i < count; i++) {
+            String value = values.get(i);
+            buf.writeUtf(value == null ? "" : value, maxLength);
         }
-        public static void handle(VerificationCompletePacket msg,
-                                  Supplier<net.minecraftforge.network.NetworkEvent.Context> ctx) {
-            ctx.get().enqueueWork(() -> DistExecutor.unsafeRunWhenOn(Dist.CLIENT,
-                    () -> () -> ClientSideManager.commitAdministratorVerification(
-                            msg.version, msg.revision)));
-            ctx.get().setPacketHandled(true);
-        }
+    }
+
+    private static List<String> readStrings(FriendlyByteBuf buf, int maxLength) {
+        int count = Math.min(buf.readVarInt(), 2048);
+        List<String> result = new ArrayList<>(count);
+        for (int i = 0; i < count; i++) result.add(buf.readUtf(maxLength));
+        return result;
     }
 }

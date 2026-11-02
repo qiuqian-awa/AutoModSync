@@ -1,4 +1,9 @@
-AutoModSync 3.2 使用说明
+AutoModSync 4.0 使用说明（Minecraft 1.21.1 / NeoForge 21.1.248 / Java 21）
+
+构建：Gradle 8.8+ + JDK 21，运行 ./gradlew build。本机无法访问 maven.neoforged.net，因此
+build.gradle 直接使用本机已安装的 NeoForge 21.1.248 与 NeoFormRuntime 缓存；可用
+-PminecraftLibrariesDir=<路径> 覆盖 .minecraft/libraries 位置。产物为
+build/libs/AutoModSync-1.21.1-4.0.0.jar。
 
 推荐流程：管理员先用正式客户端整合包进入服务器，处理仅服务端但错误声明双端的模组（在
 automodsync_server_storage/forced_sync/custom/rules.json 中添加 IGNORE），完成一次严格同步并成功进服，
